@@ -1,12 +1,12 @@
-import torch
 import numpy as np
 import numpy.typing as npt
+import torch
 
+import furniture_bench.controllers.control_utils as C
+import furniture_bench.utils.transform as T
+from furniture_bench.config import config
 from furniture_bench.furniture.parts.part import Part
 from furniture_bench.utils.pose import get_mat, is_similar_rot, is_similar_xz, rot_mat
-from furniture_bench.config import config
-import furniture_bench.utils.transform as T
-import furniture_bench.controllers.control_utils as C
 
 
 class Leg(Part):
@@ -14,18 +14,10 @@ class Leg(Part):
         super().__init__(part_config, part_idx)
         tag_ids = part_config["ids"]
 
-        self.rel_pose_from_center[tag_ids[0]] = get_mat(
-            [0, 0, -self.tag_offset], [0, 0, 0]
-        )
-        self.rel_pose_from_center[tag_ids[1]] = get_mat(
-            [-self.tag_offset, 0, 0], [0, np.pi / 2, 0]
-        )
-        self.rel_pose_from_center[tag_ids[2]] = get_mat(
-            [0, 0, self.tag_offset], [0, np.pi, 0]
-        )
-        self.rel_pose_from_center[tag_ids[3]] = get_mat(
-            [self.tag_offset, 0, 0], [0, -np.pi / 2, 0]
-        )
+        self.rel_pose_from_center[tag_ids[0]] = get_mat([0, 0, -self.tag_offset], [0, 0, 0])
+        self.rel_pose_from_center[tag_ids[1]] = get_mat([-self.tag_offset, 0, 0], [0, np.pi / 2, 0])
+        self.rel_pose_from_center[tag_ids[2]] = get_mat([0, 0, self.tag_offset], [0, np.pi, 0])
+        self.rel_pose_from_center[tag_ids[3]] = get_mat([self.tag_offset, 0, 0], [0, -np.pi / 2, 0])
 
         self.done = False
         self.pos_error_threshold = 0.01
@@ -45,13 +37,9 @@ class Leg(Part):
         self._state = "reach_leg_floor_xy"
         self.gripper_action = -1
 
-    def is_in_reset_ori(
-        self, pose: npt.NDArray[np.float32], from_skill, ori_bound
-    ) -> bool:
+    def is_in_reset_ori(self, pose: npt.NDArray[np.float32], from_skill, ori_bound) -> bool:
         # y-axis of the leg align with y-axis of the base.
-        reset_ori = (
-            self.reset_ori[from_skill] if len(self.reset_ori) > 1 else self.reset_ori[0]
-        )
+        reset_ori = self.reset_ori[from_skill] if len(self.reset_ori) > 1 else self.reset_ori[0]
         for _ in range(4):
             if is_similar_rot(pose[:3, :3], reset_ori[:3, :3], ori_bound=ori_bound):
                 return True
@@ -62,9 +50,7 @@ class Leg(Part):
         for _ in range(4):
             if mat[2, 2] > 0.8:  # Z is down.
                 break
-            mat = mat @ torch.tensor(
-                T.rotmat2hom(rot_mat([0, np.pi / 2, 0]))
-            ).float().to(mat.device)
+            mat = mat @ torch.tensor(T.rotmat2hom(rot_mat([0, np.pi / 2, 0]))).float().to(mat.device)
         return mat
 
     def fsm_step(
@@ -156,38 +142,24 @@ class Leg(Part):
                 self.prev_pose = target
                 next_state = "lift_up"
         elif self._state == "lift_up":
-            target_pos = self.prev_pose[:3, 3] + torch.tensor(
-                [0, 0, 0.10], device=device
-            )
+            target_pos = self.prev_pose[:3, 3] + torch.tensor([0, 0, 0.10], device=device)
             target_ori = ee_pose[:3, :3]
-            target = self.add_noise_first_target(
-                C.to_homogeneous(target_pos, target_ori)
-            )
-            if self.satisfy(
-                ee_pose, target, pos_error_threshold=0.02, ori_error_threshold=0.3
-            ):
+            target = self.add_noise_first_target(C.to_homogeneous(target_pos, target_ori))
+            if self.satisfy(ee_pose, target, pos_error_threshold=0.02, ori_error_threshold=0.3):
                 self.prev_pose = target
                 next_state = "move_center"
         elif self._state == "move_center":
             target_pos = torch.tensor([0.5, 0.1, 0.1], device=device)
             target_ori = self.prev_pose[:3, :3]
-            target = self.add_noise_first_target(
-                C.to_homogeneous(target_pos, target_ori)
-            )
-            if self.satisfy(
-                ee_pose, target, pos_error_threshold=0.02, ori_error_threshold=0.3
-            ):
+            target = self.add_noise_first_target(C.to_homogeneous(target_pos, target_ori))
+            if self.satisfy(ee_pose, target, pos_error_threshold=0.02, ori_error_threshold=0.3):
                 self.prev_pose = target
                 next_state = "match_leg_ori"
         elif self._state == "match_leg_ori":
             target_ori = (margin @ rot_mat_tensor(np.pi, 0, 0, device))[:3, :3]
             target_pos = torch.tensor([0.57, 0.1, 0.12], device=device)
-            target = self.add_noise_first_target(
-                C.to_homogeneous(target_pos, target_ori)
-            )
-            if self.satisfy(
-                ee_pose, target, pos_error_threshold=0.02, ori_error_threshold=0.3
-            ):
+            target = self.add_noise_first_target(C.to_homogeneous(target_pos, target_ori))
+            if self.satisfy(ee_pose, target, pos_error_threshold=0.02, ori_error_threshold=0.3):
                 self.prev_pose = target
                 next_state = "reach_table_top_xy"
         elif self._state == "reach_table_top_xy":
@@ -212,9 +184,7 @@ class Leg(Part):
             )
             rel = rel_rot_mat(leg_pose_robot, target_leg_pose_robot)
             target = rel @ ee_pose
-            if self.satisfy(
-                ee_pose, target, pos_error_threshold=0.015, ori_error_threshold=0.3
-            ):
+            if self.satisfy(ee_pose, target, pos_error_threshold=0.015, ori_error_threshold=0.3):
                 self.prev_pose = target
                 next_state = "reach_table_top_z"
         elif self._state == "reach_table_top_z":
@@ -239,9 +209,7 @@ class Leg(Part):
             )
             rel = rel_rot_mat(leg_pose_robot, target_leg_pose_robot)
             target = rel @ ee_pose
-            if self.satisfy(
-                ee_pose, target, pos_error_threshold=0.007, ori_error_threshold=0.15
-            ):
+            if self.satisfy(ee_pose, target, pos_error_threshold=0.007, ori_error_threshold=0.15):
                 self.prev_pose = target
                 next_state = "insert_wait"
         elif self._state == "insert_wait":
@@ -311,9 +279,7 @@ class Leg(Part):
                 self.prev_pose = target
                 next_state = "screw"
         elif self._state == "screw":
-            target_ori = rot_mat_tensor(np.pi, 0, -np.pi / 2 - np.pi / 36, device)[
-                :3, :3
-            ]
+            target_ori = rot_mat_tensor(np.pi, 0, -np.pi / 2 - np.pi / 36, device)[:3, :3]
             target_pos = (ee_pos)[:3]
             target_pos[2] -= 0.005
             target = C.to_homogeneous(target_pos, target_ori)
@@ -341,9 +307,7 @@ class Leg(Part):
     def _find_closest_y(self, pose):
         closest_y = pose.clone()
         for i in range(4):
-            tmp_pose = pose @ torch.tensor(
-                self.rel_pose_from_center[self.tag_ids[i]]
-            ).float().to(pose.device)
+            tmp_pose = pose @ torch.tensor(self.rel_pose_from_center[self.tag_ids[i]]).float().to(pose.device)
             if tmp_pose[1, 3] < closest_y[1, 3]:
                 closest_y = tmp_pose
         return closest_y

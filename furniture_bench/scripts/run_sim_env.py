@@ -3,23 +3,19 @@
 import argparse
 import pickle
 
-import furniture_bench
-
-import gym
 import cv2
-import torch
+import gym
 import numpy as np
+import torch
+
+import furniture_bench
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--furniture", default="square_table")
-    parser.add_argument(
-        "--file-path", help="Demo path to replay (data directory or pickle)"
-    )
-    parser.add_argument(
-        "--scripted", action="store_true", help="Execute hard-coded assembly script."
-    )
+    parser.add_argument("--file-path", help="Demo path to replay (data directory or pickle)")
+    parser.add_argument("--scripted", action="store_true", help="Execute hard-coded assembly script.")
     parser.add_argument("--no-action", action="store_true")
     parser.add_argument("--random-action", action="store_true")
     parser.add_argument(
@@ -38,9 +34,7 @@ def main():
         action="store_true",
         help="Save camera input of the simulator at the beginning of the episode.",
     )
-    parser.add_argument(
-        "--record", action="store_true", help="Record the video of the simulator."
-    )
+    parser.add_argument("--record", action="store_true", help="Record the video of the simulator.")
     parser.add_argument(
         "--high-res",
         action="store_true",
@@ -62,9 +56,7 @@ def main():
         default="FurnitureSim-v0",
         help="Environment id of FurnitureSim",
     )
-    parser.add_argument(
-        "--replay-path", type=str, help="Path to the saved data to replay action."
-    )
+    parser.add_argument("--replay-path", type=str, help="Path to the saved data to replay action.")
 
     parser.add_argument(
         "--act-rot-repr",
@@ -171,7 +163,7 @@ def main():
             ac = action_tensor(ac)
             ob, rew, done, _ = env.step(ac)
     else:
-        raise ValueError(f"No action specified")
+        raise ValueError("No action specified")
 
     print("done")
 

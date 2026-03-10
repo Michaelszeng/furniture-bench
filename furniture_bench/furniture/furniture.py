@@ -1,22 +1,23 @@
 """Define base class for all furniture. It contains the core functions and properties for the furniture (e.g., furniture parts, computing reward function, getting observation,etc.)"""
-from abc import ABC
-import time
+
 import multiprocessing as mp
+import time
+from abc import ABC
 from multiprocessing import shared_memory
-from typing import Optional, Tuple, List
+from typing import List, Optional, Tuple
 
 import numpy as np
 import numpy.typing as npt
 from gym import logger
 
 import furniture_bench.utils.transform as T
-from furniture_bench.utils.pose import is_similar_pose
 from furniture_bench.config import config
+from furniture_bench.furniture.parts.obstacle_front import ObstacleFront
+from furniture_bench.furniture.parts.obstacle_left import ObstacleLeft
+from furniture_bench.furniture.parts.obstacle_right import ObstacleRight
 from furniture_bench.furniture.parts.part import Part
 from furniture_bench.utils.detection import detection_loop
-from furniture_bench.furniture.parts.obstacle_front import ObstacleFront
-from furniture_bench.furniture.parts.obstacle_right import ObstacleRight
-from furniture_bench.furniture.parts.obstacle_left import ObstacleLeft
+from furniture_bench.utils.pose import is_similar_pose
 
 
 class Furniture(ABC):
@@ -58,16 +59,13 @@ class Furniture(ABC):
         self.reset_ori_bound = 0.96  # 15 degrees.
         self.max_env_steps_skills = [0, 250, 250, 250, 250, 350]
         self.max_env_steps_from_skills = [
-            sum(self.max_env_steps_skills[i:])
-            for i in range(len(self.max_env_steps_skills) - 1)
+            sum(self.max_env_steps_skills[i:]) for i in range(len(self.max_env_steps_skills) - 1)
         ]
         # Check whether the furniture is assembled.
         # If the value is smaller than these thresholds, we consider the furniture is assembled.
         self.assembled_pos_threshold = config["furniture"]["assembled_pos_threshold"]
 
-    def randomize_init_pose(
-        self, from_skill, pos_range=[-0.05, 0.05], rot_range=45
-    ) -> bool:
+    def randomize_init_pose(self, from_skill, pos_range=[-0.05, 0.05], rot_range=45) -> bool:
         """Randomize the furniture initial pose."""
         trial = 0
         max_trial = 300000
@@ -101,10 +99,7 @@ class Furniture(ABC):
                         pos_range=[-0.0, 0.0],
                         rot_range=0,
                     )
-                elif (
-                    part.part_attached_skill_idx <= from_skill
-                    and self.skill_attach_part_idx == i
-                ):
+                elif part.part_attached_skill_idx <= from_skill and self.skill_attach_part_idx == i:
                     attached_part, attach_to = self.attach(part)
                     if attached_part:
                         self.set_attached_pose(part, attach_to, from_skill)
@@ -145,9 +140,7 @@ class Furniture(ABC):
             part_pose = parts_poses[part_idx * 7 : (part_idx + 1) * 7]
             part_pose = T.pose2mat(part_pose)
             if not founds[part_idx]:
-                print(
-                    f"[reset] Part {self.__class__.__name__} [{part_idx}] is not found"
-                )
+                print(f"[reset] Part {self.__class__.__name__} [{part_idx}] is not found")
 
                 if check_found_only:
                     return False
@@ -163,11 +156,6 @@ class Furniture(ABC):
             ):
                 return False
         return True
-
-    def randomize_high(self, high_random_idx: int):
-        """Initialize furniture parts with predefined poses of high randomness."""
-        for part in self.parts:
-            part.randomize_init_pose_high(high_random_idx)
 
     def reset_pose_filter(self):
         for part in self.parts:
@@ -263,30 +251,14 @@ class Furniture(ABC):
         color_shm3 = shared_memory.SharedMemory(name=self.shm[6])
         depth_shm3 = shared_memory.SharedMemory(name=self.shm[7])
 
-        parts_poses = np.ndarray(
-            shape=(self.num_parts * 7,), dtype=np.float32, buffer=parts_poses_shm.buf
-        )
-        parts_found = np.ndarray(
-            shape=(self.num_parts,), dtype=bool, buffer=parts_founds_shm.buf
-        )
-        color_img1 = np.ndarray(
-            shape=self.color_shape, dtype=np.uint8, buffer=color_shm1.buf
-        )
-        depth_img1 = np.ndarray(
-            shape=self.depth_shape, dtype=np.uint16, buffer=depth_shm1.buf
-        )
-        color_img2 = np.ndarray(
-            shape=self.color_shape, dtype=np.uint8, buffer=color_shm2.buf
-        )
-        depth_img2 = np.ndarray(
-            shape=self.depth_shape, dtype=np.uint16, buffer=depth_shm2.buf
-        )
-        color_img3 = np.ndarray(
-            shape=self.color_shape, dtype=np.uint8, buffer=color_shm3.buf
-        )
-        depth_img3 = np.ndarray(
-            shape=self.depth_shape, dtype=np.uint16, buffer=depth_shm3.buf
-        )
+        parts_poses = np.ndarray(shape=(self.num_parts * 7,), dtype=np.float32, buffer=parts_poses_shm.buf)
+        parts_found = np.ndarray(shape=(self.num_parts,), dtype=bool, buffer=parts_founds_shm.buf)
+        color_img1 = np.ndarray(shape=self.color_shape, dtype=np.uint8, buffer=color_shm1.buf)
+        depth_img1 = np.ndarray(shape=self.depth_shape, dtype=np.uint16, buffer=depth_shm1.buf)
+        color_img2 = np.ndarray(shape=self.color_shape, dtype=np.uint8, buffer=color_shm2.buf)
+        depth_img2 = np.ndarray(shape=self.depth_shape, dtype=np.uint16, buffer=depth_shm2.buf)
+        color_img3 = np.ndarray(shape=self.color_shape, dtype=np.uint8, buffer=color_shm3.buf)
+        depth_img3 = np.ndarray(shape=self.depth_shape, dtype=np.uint16, buffer=depth_shm3.buf)
 
         return (
             parts_poses.copy(),
@@ -302,14 +274,10 @@ class Furniture(ABC):
     def create_shared_memory(self) -> Tuple[str, str, str, str, str, str, str, str]:
         """Create shared memory to save the parts poses and images."""
         parts_poses = np.zeros(shape=(self.num_parts * 7,), dtype=np.float32)
-        parts_poses_shm = shared_memory.SharedMemory(
-            create=True, size=parts_poses.nbytes
-        )
+        parts_poses_shm = shared_memory.SharedMemory(create=True, size=parts_poses.nbytes)
 
         parts_founds = np.zeros(shape=(self.num_parts,), dtype=bool)
-        parts_founds_shm = shared_memory.SharedMemory(
-            create=True, size=parts_founds.nbytes
-        )
+        parts_founds_shm = shared_memory.SharedMemory(create=True, size=parts_founds.nbytes)
 
         color_shm1, depth_shm1 = self._create_shared_memory_for_img()
         color_shm2, depth_shm2 = self._create_shared_memory_for_img()
@@ -379,9 +347,7 @@ class Furniture(ABC):
         for assemble_idx in self.should_be_assembled:
             part_idx1, part_idx2 = assemble_idx
             pair = (part_idx1, part_idx2)
-            if (
-                part_idx == assemble_idx[0] or part_idx == assemble_idx[1]
-            ) and pair not in self.assembled_set:
+            if (part_idx == assemble_idx[0] or part_idx == assemble_idx[1]) and pair not in self.assembled_set:
                 self._log_assemble_set()
                 self.assembled_set.add(pair)
                 logger.info(f"{pair} assembled")
@@ -398,9 +364,7 @@ class Furniture(ABC):
         for part_idx in range(len(self.parts)):
             part_pose = parts_poses[7 * part_idx : 7 * (part_idx + 1)]
             if not self.is_in_pos_lim(part_pose):
-                logger.warn(
-                    f"[env] part {self.parts[part_idx]} {[part_idx]} out of positional limits."
-                )
+                logger.warn(f"[env] part {self.parts[part_idx]} {[part_idx]} out of positional limits.")
                 return True
         return False
 
@@ -453,9 +417,7 @@ class Furniture(ABC):
             raise Exception("No relative pose!")
 
         for assembled_rel_pose in assembled_rel_poses:
-            ori_bound = (
-                -1 if (part_idx1, part_idx2) in self.position_only else self.ori_bound
-            )
+            ori_bound = -1 if (part_idx1, part_idx2) in self.position_only else self.ori_bound
             if is_similar_pose(
                 assembled_rel_pose,
                 rel_pose,

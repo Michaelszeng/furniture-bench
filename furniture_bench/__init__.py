@@ -35,11 +35,6 @@ register(
     entry_point="furniture_bench.envs.furniture_sim_env:FurnitureSimEnv",
 )
 
-register(
-    id="FurnitureSimLegacy-v0",
-    entry_point="furniture_bench.envs.legacy_envs.furniture_sim_legacy_env:FurnitureSimEnvLegacy",
-)
-
 # FurnitureSim environment with all available observation.
 register(
     id="FurnitureSimFull-v0",
