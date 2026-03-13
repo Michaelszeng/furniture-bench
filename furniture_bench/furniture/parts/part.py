@@ -1,10 +1,12 @@
 import copy
+import math
 import pdb
 from abc import ABC, abstractmethod
 
 import numpy as np
 import numpy.typing as npt
 import torch
+from rich import print
 
 import furniture_bench.controllers.control_utils as C
 import furniture_bench.utils.transform as T
@@ -36,6 +38,7 @@ class Part(ABC):
 
         self.default_assembled_pose = part_config.get("default_assembled_pose", None)
         self.collision_margin = 0.01
+        # Backward-compat fields used by non-one_leg parts (cabinet, lamp, round_table)
         self.first_setting_target = True
         self.target = None
         self.prev_cnt = 0
@@ -181,36 +184,101 @@ class Part(ABC):
         pos_error_threshold=None,
         ori_error_threshold=None,
         max_len=25,
-    ) -> bool:
+    ):
+        """Check whether current pose satisfies target pose.
+
+        Returns True if within thresholds, False if not yet there, "TIMEOUT" if max_len exceeded.
+        """
         if pos_error_threshold is None:
             pos_error_threshold = self.pos_error_threshold
         if ori_error_threshold is None:
             ori_error_threshold = self.ori_error_threshold
 
-        if ((current[:3, 3] - target[:3, 3]).abs().sum() < pos_error_threshold) and (
-            (target[:3, :3] - current[:3, :3]).abs().sum() < ori_error_threshold
-        ):
+        pos_err = (current[:3, 3] - target[:3, 3]).abs().sum()
+        ori_err = (target[:3, :3] - current[:3, :3]).abs().sum()
+        print(f"pos_err: {pos_err.item():.4f}, ori_err: {ori_err.item():.4f}")
+        if pos_err < pos_error_threshold and ori_err < ori_error_threshold:
             return True
-        if self.curr_cnt - self.prev_cnt >= max_len:
-            print("phase time out")
-            return True
+        elapsed = self.curr_cnt - self.prev_cnt
+        if elapsed >= max_len:
+            print(
+                f"[TIMEOUT] {self.name} satisfy after {elapsed} steps (pos_err={pos_err.item():.4f}, ori_err={ori_err.item():.4f})"
+            )
+            return "TIMEOUT"
         return False
 
-    def gripper_less(self, gripper_width, target_width, cnt_max=10):
+    def gripper_less(self, gripper_width, target_width, cnt_max=50):
+        """Check if gripper width is less than target width."""
         if gripper_width <= target_width:
             return True
-        if self.curr_cnt - self.prev_cnt >= cnt_max:
-            return True
+        elapsed = self.curr_cnt - self.prev_cnt
+        if elapsed >= cnt_max:
+            print(f"[TIMEOUT] {self.name} gripper_less after {elapsed} steps (width={gripper_width.item():.4f})")
+            return "TIMEOUT"
         return False
 
-    def gripper_greater(self, gripper_width, target_width, cnt_max=10):
+    def gripper_greater(self, gripper_width, target_width, cnt_max=30):
+        """Check if gripper width is greater than target width."""
         if gripper_width >= target_width:
             return True
-        if self.curr_cnt - self.prev_cnt >= cnt_max:
-            return True
+        elapsed = self.curr_cnt - self.prev_cnt
+        if elapsed >= cnt_max:
+            print(f"[TIMEOUT] {self.name} gripper_greater after {elapsed} steps (width={gripper_width.item():.4f})")
+            return "TIMEOUT"
         return False
 
+    def state_transition_handler(self, prev_state, new_state) -> int:
+        """Handle state change bookkeeping: reset timeout window on transition, return skill_complete flag."""
+        if new_state != prev_state:
+            print(f"[yellow][FSM][/yellow] {self.name}: {prev_state} -> {new_state}")
+            self.prev_cnt = self.curr_cnt
+        self.curr_cnt += 1
+        self._last_state = new_state
+        # Only fire skill_complete on the step we first enter a skill_complete state
+        return 1 if (new_state != prev_state and new_state in self.skill_complete_next_states) else 0
+
+    def _add_noise(self, target, pos_std=0.004, ori_std_deg=4.0):
+        """Apply per-step Gaussian noise to a homogeneous target matrix."""
+        if self.state_no_noise():
+            return target
+        noisy = target.clone()
+        noisy[:3, 3] += torch.normal(mean=torch.zeros(3), std=torch.tensor(pos_std, dtype=torch.float32)).to(
+            target.device
+        )
+        ori = C.mat2quat(noisy[:3, :3]).to(target.device)
+        ori = C.quat_multiply(
+            ori,
+            torch.tensor(
+                T.axisangle2quat(
+                    [
+                        np.radians(np.random.normal(0, ori_std_deg)),
+                        np.radians(np.random.normal(0, ori_std_deg)),
+                        np.radians(np.random.normal(0, ori_std_deg)),
+                    ]
+                ),
+                device=target.device,
+            ),
+        ).to(target.device)
+        noisy[:3, :3] = C.quat2mat(ori)
+        return noisy
+
+    def reset(self):
+        self.pre_assemble_done = False
+        self._last_state = ""
+        self.gripper_action = -1
+        self.prev_cnt = 0
+        self.curr_cnt = 0
+        # Backward-compat reset for non-Markovian parts
+        self.first_setting_target = True
+        self.target = None
+
+    def state_no_noise(self):
+        return False
+
+    # ---- Backward-compat methods for non-one_leg parts (cabinet, lamp, round_table) ----
+
     def may_transit_state(self, next_state):
+        """Legacy non-Markovian state transition. Kept for cabinet/lamp/round_table parts."""
         skill_complete = 0
         if next_state != self._state:
             print(f"Changing state from {self._state} to {next_state}")
@@ -223,6 +291,7 @@ class Part(ABC):
         return skill_complete
 
     def add_noise_first_target(self, target, pos_noise=None, ori_noise=None):
+        """Legacy per-state-entry noise. Kept for cabinet/lamp/round_table parts."""
         if self.state_no_noise():
             return target
         if self.first_setting_target:
@@ -250,14 +319,3 @@ class Part(ABC):
             self.target = C.to_homogeneous(target[:3, 3], C.quat2mat(ori))
             self.first_setting_target = False
         return self.target
-
-    def reset(self):
-        self.pre_assemble_done = False
-        self._state = ""
-        self.gripper_action = -1
-        self.prev_cnt = 0
-        self.curr_cnt = 0
-        self.first_setting_target = True
-
-    def state_no_noise(self):
-        return False

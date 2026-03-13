@@ -24,6 +24,7 @@ import cv2
 import gym
 import numpy as np
 import torch
+from rich import print
 
 import furniture_bench.controllers.control_utils as C
 import furniture_bench.utils.transform as T
@@ -102,7 +103,7 @@ class FurnitureSimEnv(gym.Env):
         super(FurnitureSimEnv, self).__init__()
         self.device = torch.device("cuda", compute_device_id)
 
-        self.assemble_idx = 0
+        self.scripted_timeout = False
         # Furniture for each environment (reward, reset).
         self.furnitures = [furniture_factory(furniture) for _ in range(num_envs)]
 
@@ -125,7 +126,6 @@ class FurnitureSimEnv(gym.Env):
         self.manual_label = manual_label
         self.manual_done = manual_done
         self.headless = headless
-        self.move_neutral = False
         self.ctrl_started = False
         self.init_assembled = init_assembled
         self.np_step_out = np_step_out
@@ -808,10 +808,15 @@ class FurnitureSimEnv(gym.Env):
         obs = self._get_observation()
         self.env_steps += 1
 
+        done = self._done()
+        # If scripted policy timed out, force done=True (episode is a failure)
+        if self.scripted_timeout:
+            done = torch.ones_like(done)
+
         return (
             obs,
             self._reward(),
-            self._done(),
+            done,
             {"obs_success": True, "action_success": True},
         )
 
@@ -1139,9 +1144,9 @@ class FurnitureSimEnv(gym.Env):
             self.refresh()
 
         self.furniture.reset()
+        self.scripted_timeout = False
 
         self.refresh()
-        self.assemble_idx = 0
 
         if self.save_camera_input:
             self._save_camera_input()
@@ -1182,7 +1187,7 @@ class FurnitureSimEnv(gym.Env):
         if reset_parts:
             self._reset_parts(env_idx)
         self.env_steps[env_idx] = 0
-        self.move_neutral = False
+        self.scripted_timeout = False
 
     def reset_env_to(self, env_idx, state):
         """Reset to a specific state. **MUST refresh in between multiple calls
@@ -1204,7 +1209,7 @@ class FurnitureSimEnv(gym.Env):
         self._reset_franka(env_idx, dof_pos)
         self._reset_parts(env_idx, state["parts_poses"])
         self.env_steps[env_idx] = 0
-        self.move_neutral = False
+        self.scripted_timeout = False
 
     def _update_franka_dof_state_buffer(self, dof_pos=None):
         """
@@ -1363,9 +1368,28 @@ class FurnitureSimEnv(gym.Env):
         asset_options.flip_visual_attachments = True
         return self.isaac_gym.load_asset(self.sim, ASSET_ROOT, self.franka_asset_file, asset_options)
 
+    def _detect_assemble_idx(self) -> int:
+        """Markovian: find the first unassembled pair by checking env state."""
+        for idx, (i, j) in enumerate(self.furniture.should_be_assembled):
+            part1_name = self.furniture.parts[i].name
+            part2_name = self.furniture.parts[j].name
+            part1_pose = C.to_homogeneous(
+                self.rb_states[self.part_idxs[part1_name]][0][:3],
+                C.quat2mat(self.rb_states[self.part_idxs[part1_name]][0][3:7]),
+            )
+            part2_pose = C.to_homogeneous(
+                self.rb_states[self.part_idxs[part2_name]][0][:3],
+                C.quat2mat(self.rb_states[self.part_idxs[part2_name]][0][3:7]),
+            )
+            rel_pose = torch.linalg.inv(part1_pose) @ part2_pose
+            assembled_rel_poses = self.furniture.assembled_rel_poses[(i, j)]
+            if not self.furniture.assembled(rel_pose.cpu().numpy(), assembled_rel_poses):
+                return idx
+        return len(self.furniture.should_be_assembled)  # all assembled
+
     def get_assembly_action(self) -> torch.Tensor:
         """
-        Scripted furniture assembly logic.
+        Scripted furniture assembly logic (Markovian: all state inferred from env).
 
         Returns:
             Tuple (action for the assembly task, skill complete mask)
@@ -1374,57 +1398,47 @@ class FurnitureSimEnv(gym.Env):
         if self.furniture_name not in ["one_leg", "cabinet", "lamp", "round_table"]:
             raise NotImplementedError("[one_leg, cabinet, lamp, round_table] are supported for scripted agent")
 
-        # Read current EE pose, gripper width
+        # Read current EE pose, gripper width, and angular velocity
         ee_pos, ee_quat = self.get_ee_pose()
         gripper_width = self.gripper_width()
         ee_pos, ee_quat = ee_pos.squeeze(), ee_quat.squeeze()
+        ee_ang_vel = self.rb_states[self.ee_idxs, 10:13].squeeze()
 
-        # self.move_neutral indicates that the EE should move up to a neutral position (above the table)
-        # Here, we simply set goal_pos equal to current EE position, but with z-coordinate set to 0.15
-        if self.move_neutral:
-            if ee_pos[2] <= 0.15 - 0.01:
+        # Markovian assembly index: scan env state to find first unassembled pair
+        assemble_idx = self._detect_assemble_idx()
+        n_pairs = len(self.furniture.should_be_assembled)
+
+        print(f"[green][ENV][/green] assemble_idx={assemble_idx}/{n_pairs}, ee_z={ee_pos[2]:.3f}")
+
+        # Move-neutral: after all pairs assembled (or between pairs), lift EE before proceeding to next pair
+        if assemble_idx >= n_pairs:
+            if ee_pos[2] < 0.14:
                 gripper = torch.tensor([-1], dtype=torch.float32, device=self.device)
                 goal_pos = torch.tensor([ee_pos[0], ee_pos[1], 0.15], device=self.device)
                 delta_pos = goal_pos - ee_pos
-                delta_quat = torch.tensor([0, 0, 0, 1], device=self.device)  # No rotation change
+                delta_quat = torch.tensor([0, 0, 0, 1], device=self.device)
                 action = torch.concat([delta_pos, delta_quat, gripper])
                 return action.unsqueeze(0), 0
-            # If we've moved high enough, set move_neutral to False
             else:
-                self.move_neutral = False
+                # All assembled and EE is high: done
+                return (
+                    torch.tensor([0, 0, 0, 0, 0, 0, 1, -1], dtype=torch.float32, device=self.device).unsqueeze(0),
+                    1,
+                )
 
         # Get next pair of parts to assemble
-        part_idx1, part_idx2 = self.furniture.should_be_assembled[self.assemble_idx]
-
+        part_idx1, part_idx2 = self.furniture.should_be_assembled[assemble_idx]
         part1 = self.furniture.parts[part_idx1]
-        part1_name = self.furniture.parts[part_idx1].name
-        part1_pose = C.to_homogeneous(  # convert to 4x4 homogeneous matrix
-            self.rb_states[self.part_idxs[part1_name]][0][:3],
-            C.quat2mat(self.rb_states[self.part_idxs[part1_name]][0][3:7]),
-        )
         part2 = self.furniture.parts[part_idx2]
-        part2_name = self.furniture.parts[part_idx2].name
-        part2_pose = C.to_homogeneous(  # convert to 4x4 homogeneous matrix
-            self.rb_states[self.part_idxs[part2_name]][0][:3],
-            C.quat2mat(self.rb_states[self.part_idxs[part2_name]][0][3:7]),
-        )
 
-        # Compute current relative pose and desired relative pose
-        rel_pose = torch.linalg.inv(part1_pose) @ part2_pose
-        assembled_rel_poses = self.furniture.assembled_rel_poses[(part_idx1, part_idx2)]
+        # Check whether to pre-assemble part1 (use cached flag set by pre_assemble() on completion)
+        part1_pre_assemble_done = not hasattr(part1, "compute_pre_assemble_state") or part1.pre_assemble_done
+        part2_pre_assemble_done = not hasattr(part2, "compute_pre_assemble_state") or part2.pre_assemble_done
 
-        # Check success criteria
-        if self.furniture.assembled(rel_pose.cpu().numpy(), assembled_rel_poses):
-            self.assemble_idx += 1
-            self.move_neutral = True
-            return (
-                torch.tensor([0, 0, 0, 0, 0, 0, 1, -1], dtype=torch.float32, device=self.device).unsqueeze(0),
-                1,
-            )  # Skill complete is always 1 when assembled
-
-        # Check whether to pre-assemble part1, part2, or assemble both
-        if not part1.pre_assemble_done:
-            goal_pos, goal_ori, gripper, skill_complete = part1.pre_assemble(
+        timeout_failure = False
+        if not part1_pre_assemble_done:
+            print(f"[green][ENV][/green] pre-assembling part1={part1.name}")
+            goal_pos, goal_ori, gripper, skill_complete, timeout_failure = part1.pre_assemble(
                 ee_pos,
                 ee_quat,
                 gripper_width,
@@ -1433,8 +1447,9 @@ class FurnitureSimEnv(gym.Env):
                 self.sim_to_april_mat,
                 self.april_to_robot_mat,
             )
-        elif not part2.pre_assemble_done:
-            goal_pos, goal_ori, gripper, skill_complete = part2.pre_assemble(
+        elif not part2_pre_assemble_done:
+            print(f"[green][ENV][/green] pre-assembling part2={part2.name}")
+            goal_pos, goal_ori, gripper, skill_complete, timeout_failure = part2.pre_assemble(
                 ee_pos,
                 ee_quat,
                 gripper_width,
@@ -1444,7 +1459,8 @@ class FurnitureSimEnv(gym.Env):
                 self.april_to_robot_mat,
             )
         else:
-            goal_pos, goal_ori, gripper, skill_complete = part2.fsm_step(
+            print(f"[green][ENV][/green] fsm_step part2={part2.name}, assemble_to={part1.name}")
+            goal_pos, goal_ori, gripper, skill_complete, timeout_failure = part2.fsm_step(
                 ee_pos,
                 ee_quat,
                 gripper_width,
@@ -1453,7 +1469,16 @@ class FurnitureSimEnv(gym.Env):
                 self.sim_to_april_mat,
                 self.april_to_robot_mat,
                 self.furniture.parts[part_idx1].name,
+                ee_ang_vel=ee_ang_vel,
             )
+
+        if timeout_failure:
+            print("[green][ENV][/green] scripted_timeout triggered — marking episode as failure")
+            self.scripted_timeout = True
+            zero_action = torch.zeros(8, dtype=torch.float32, device=self.device)
+            zero_action[6] = 1  # qw=1 (identity quaternion)
+            zero_action[7] = -1  # gripper open
+            return zero_action.unsqueeze(0), 0
 
         # Compute delta position between goal position and current EE position
         delta_pos = goal_pos - ee_pos
