@@ -252,7 +252,7 @@ class FurnitureSimEnv(gym.Env):
         for i in range(self.num_envs):
             env = self.isaac_gym.create_env(self.sim, env_lower, env_upper, num_per_row)
             self.envs.append(env)
-            # Add workspace (table).
+            # Add workspace (table)
             table_pose = gymapi.Transform()
             table_pose.p = gymapi.Vec3(0.0, 0.0, table_pos.z)
 
