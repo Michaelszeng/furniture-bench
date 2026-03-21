@@ -258,7 +258,9 @@ class FurnitureSimEnv(gym.Env):
 
             table_handle = self.isaac_gym.create_actor(env, self.table_asset, table_pose, "table", i, 0)
             table_props = self.isaac_gym.get_actor_rigid_shape_properties(env, table_handle)
-            table_props[0].friction = sim_config["table"]["friction"]
+            # My sus dataset processing scripts sometimes remove the table collision geometry so this check is needed
+            if table_props:
+                table_props[0].friction = sim_config["table"]["friction"]
             self.isaac_gym.set_actor_rigid_shape_properties(env, table_handle, table_props)
 
             self.base_tag_pose = gymapi.Transform()

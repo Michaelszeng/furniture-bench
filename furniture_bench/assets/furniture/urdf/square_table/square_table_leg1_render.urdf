@@ -1,0 +1,9 @@
+<robot name="square_table_leg1">
+    <link name="square_table_leg1">
+        <visual>
+            <geometry>
+                <mesh filename="../mesh/square_table/square_table_leg1.obj" scale="1 1 1" />
+            </geometry>
+        </visual>
+        </link>
+</robot>

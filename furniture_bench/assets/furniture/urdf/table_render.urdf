@@ -1,0 +1,9 @@
+<robot name="table">
+    <link name="table">
+        <visual>
+            <geometry>
+                <mesh filename="../mesh/table.obj" scale="1 1 1" />
+            </geometry>
+        </visual>
+        </link>
+</robot>
