@@ -39,6 +39,7 @@ sim_params.physx.contact_offset = 0.002
 sim_params.physx.friction_offset_threshold = 0.01
 sim_params.physx.friction_correlation_distance = 0.0005
 sim_params.physx.use_gpu = True
+sim_params.physx.max_gpu_contact_pairs = 1024 * 1024 * 32  # 32M pairs; default 1M is too small for large n_envs
 
 sim_config["sim_params"] = sim_params
 sim_config["parts"] = {"friction": 0.15}
