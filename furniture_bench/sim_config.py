@@ -1,5 +1,7 @@
 """Define additional parameters based on real-world config for simulator."""
 
+import os
+
 from isaacgym import gymapi
 
 from furniture_bench.config import config
@@ -39,7 +41,8 @@ sim_params.physx.contact_offset = 0.002
 sim_params.physx.friction_offset_threshold = 0.01
 sim_params.physx.friction_correlation_distance = 0.0005
 sim_params.physx.use_gpu = True
-sim_params.physx.max_gpu_contact_pairs = 1024 * 1024 * 32  # 32M pairs; default 1M is too small for large n_envs
+if _max_contact_pairs := int(os.environ.get("PHYSX_MAX_GPU_CONTACT_PAIRS", 0)):
+    sim_params.physx.max_gpu_contact_pairs = _max_contact_pairs
 
 sim_config["sim_params"] = sim_params
 sim_config["parts"] = {"friction": 0.15}

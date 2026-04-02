@@ -37,6 +37,7 @@ class Leg(Part):
         super().reset()  # resets prev_cnt=0, curr_cnt=0, pre_assemble_done, etc.
         self._last_state = "reach_leg_floor_xy"
         self.gripper_action = -1
+        self.screw_mode = "standard"  # latent variable: "standard" or "alternate" (-90° Z offset)
 
     def is_in_reset_ori(self, pose: npt.NDArray[np.float32], from_skill, ori_bound) -> bool:
         # y-axis of the leg align with y-axis of the base.
@@ -153,11 +154,15 @@ class Leg(Part):
         table_top_z = table_pose_robot[2, 3]
         insert_z = table_top_z + 0.0625
 
-        # Hard-coded INSERTED-phase orientations.
-        # pre_screw_ori: Rx(π)@Rz(π) — target for post-insertion repositioning before grip.
-        # screw_ori:     Rx(π)        — -180° global Z from pre_screw (completes full rotation).
-        pre_screw_ori = rot_mat_tensor(np.pi, 0, np.pi)[:3, :3]
-        screw_ori = rot_mat_tensor(np.pi, 0, 0)[:3, :3]
+        # Hard-coded INSERTED-phase orientations (mode-dependent).
+        # Standard:  pre_screw = Rx(π)@Rz(π),   screw_done = Rx(π)           (−180° around Z)
+        # Alternate: pre_screw = Rx(π)@Rz(π/2), screw_done = Rx(π)@Rz(−π/2) (same arc, −90° offset)
+        if self.screw_mode == "alternate":
+            pre_screw_ori = rot_mat_tensor(np.pi, 0, np.pi / 2)[:3, :3]
+            screw_ori = rot_mat_tensor(np.pi, 0, -np.pi / 2)[:3, :3]
+        else:
+            pre_screw_ori = rot_mat_tensor(np.pi, 0, np.pi)[:3, :3]
+            screw_ori = rot_mat_tensor(np.pi, 0, 0)[:3, :3]
 
         # Stable pre-screw position: table hole XY + insert_z height.
         # Using the stable table reference (not the bouncing leg) avoids the EE chasing
@@ -549,11 +554,20 @@ class Leg(Part):
             # 2-stage sequence: first right the gripper (so it is vertical); then, rotate +180 deg about
             # world-Z to pre_screw_ori.
             if ee_z_dot_down < 0.99:
-                # Phase 1: right the gripper.
+                # Phase 1: right the gripper (same for both modes).
                 target_ori = rot_mat_tensor(np.pi, 0, 0, device)[:3, :3]
-            else:
-                # Split the 180-deg rotation into two phases so it's unambigious which way to rotate
-                # We exect ee_x_dot_world_x to be neg. when the EE is facing the right way (pre_screw_ori)
+            elif self.screw_mode == "alternate":
+                ee_x_dot_world_y = ee_pose[1, 0]
+                if ee_x_dot_world_y < 0.2:
+                    # Phase 2a: rotate to Rz(30°) first.
+                    print("phase 2a")
+                    target_ori = rot_mat_tensor(np.pi, 0, np.pi / 4, device)[:3, :3]
+                else:
+                    # Phase 2b: final 90° CCW to Rx(π)@Rz(π/2).
+                    print("phase 2b")
+                    target_ori = rot_mat_tensor(np.pi, 0, np.pi / 2, device)[:3, :3]
+            else:  # standard
+                # Standard mode: 180° rotation split into two 90° phases to avoid ambiguity.
                 if ee_x_dot_world_x > 0.25:
                     # Phase 2a: first 90° CCW about world-Z.
                     print("phase 2a")
@@ -581,7 +595,10 @@ class Leg(Part):
             table_pose_robot = april_to_robot @ table_pose
             target_pos = table_hole_pose_robot[:3, 3].clone()
             target_pos[2] = table_pose_robot[2, 3] + 0.065
-            target_ori = rot_mat_tensor(np.pi, 0, np.pi, device)[:3, :3]
+            if self.screw_mode == "alternate":
+                target_ori = rot_mat_tensor(np.pi, 0, np.pi / 2, device)[:3, :3]
+            else:  # standard
+                target_ori = rot_mat_tensor(np.pi, 0, np.pi, device)[:3, :3]
             clean_target = C.to_homogeneous(target_pos, target_ori)
             target = self._add_noise(clean_target, pos_std=0.0005, ori_std_deg=1.0)
             self.gripper_action = 1
@@ -597,14 +614,25 @@ class Leg(Part):
             ee_x_dot_world_x = ee_pose[0, 0]
             target_pos = ee_pos[:3].clone()
             target_pos[2] -= 0.005
-            if ee_x_dot_world_x < -0.25:
-                # Phase 2a: first 90° CW (Rz: π → π/2).
-                print("phase 2a")
-                target_ori = rot_mat_tensor(np.pi, 0, np.pi / 2, device)[:3, :3]
-            else:
-                # Phase 2b: final 90° CW (Rz: π/2 → 0) to screw target.
-                print("phase 2b")
-                target_ori = rot_mat_tensor(np.pi, 0, 0, device)[:3, :3]
+            if self.screw_mode == "alternate":
+                ee_x_dot_world_y = ee_pose[1, 0]
+                if ee_x_dot_world_y > 0.75:
+                    # Phase a: first 90° CW (Rz: π/2 → 0).
+                    print("phase 2a")
+                    target_ori = rot_mat_tensor(np.pi, 0, 0, device)[:3, :3]
+                else:
+                    # Phase b: second 90° CW (Rz: 0 → −π/2).
+                    print("phase 2b")
+                    target_ori = rot_mat_tensor(np.pi, 0, -np.pi / 2, device)[:3, :3]
+            else:  # standard
+                if ee_x_dot_world_x < -0.25:
+                    # Phase 2a: first 90° CW (Rz: π → π/2).
+                    print("phase 2a")
+                    target_ori = rot_mat_tensor(np.pi, 0, np.pi / 2, device)[:3, :3]
+                else:
+                    # Phase 2b: final 90° CW (Rz: π/2 → 0) to screw target.
+                    print("phase 2b")
+                    target_ori = rot_mat_tensor(np.pi, 0, 0, device)[:3, :3]
             clean_target = C.to_homogeneous(target_pos, target_ori)
             target = self._add_noise(clean_target, pos_std=0.0005, ori_std_deg=1.0)
             result = self.satisfy(ee_pose, target, ori_error_threshold=0.3, max_len=75)
