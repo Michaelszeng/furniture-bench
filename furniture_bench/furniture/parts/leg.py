@@ -343,6 +343,7 @@ class Leg(Part):
 
         # Default target to current EE pose (overridden in each state)
         target = ee_pose.clone()
+        clean_target = ee_pose.clone()
 
         if state == "reach_leg_floor_xy":
             leg_pose_down = self._find_down_z(leg_pose).clone().to(device)
@@ -365,7 +366,8 @@ class Leg(Part):
             target_pos[2] = ee_pos[2]
             target_pos[1] += 0.01
             target_pos[0] += self.grasp_margin_x
-            target = self._add_noise(C.to_homogeneous(target_pos, target_ori), pos_std=0.005, ori_std_deg=5.0)
+            clean_target = C.to_homogeneous(target_pos, target_ori)
+            target = self._add_noise(clean_target, pos_std=0.005, ori_std_deg=5.0)
             # Large XY motion from neutral to leg (can be 10-15 cm); needs many steps.
             result = self.satisfy(ee_pose, target, pos_error_threshold=0.02, max_len=150)
             if result == "TIMEOUT":
@@ -379,7 +381,8 @@ class Leg(Part):
             target_pos[1] += 0.01
             target_pos[0] += self.grasp_margin_x
             target_pos[2] -= 0.005
-            target = self._add_noise(C.to_homogeneous(target_pos, target_ori), pos_std=0.003, ori_std_deg=3.0)
+            clean_target = C.to_homogeneous(target_pos, target_ori)
+            target = self._add_noise(clean_target, pos_std=0.003, ori_std_deg=3.0)
             result = self.satisfy(ee_pose, target, pos_error_threshold=0.015, ori_error_threshold=0.1, max_len=150)
             if result == "TIMEOUT":
                 timeout_failure = True
@@ -391,7 +394,8 @@ class Leg(Part):
             target_pos[1] += 0.01
             target_pos[0] += self.grasp_margin_x
             target_pos[2] = (april_to_robot @ leg_pose)[2, 3]
-            target = self._add_noise(C.to_homogeneous(target_pos, target_ori), pos_std=0.0015, ori_std_deg=1.5)
+            clean_target = C.to_homogeneous(target_pos, target_ori)
+            target = self._add_noise(clean_target, pos_std=0.0015, ori_std_deg=1.5)
             result = self.satisfy(ee_pose, target, pos_error_threshold=0.015, ori_error_threshold=0.3, max_len=150)
             if result == "TIMEOUT":
                 timeout_failure = True
@@ -403,7 +407,8 @@ class Leg(Part):
             target_pos[1] += 0.01
             target_pos[0] += self.grasp_margin_x
             target_pos[2] = (april_to_robot @ leg_pose)[2, 3]
-            target = self._add_noise(C.to_homogeneous(target_pos, target_ori), pos_std=0.003, ori_std_deg=3.0)
+            clean_target = C.to_homogeneous(target_pos, target_ori)
+            target = self._add_noise(clean_target, pos_std=0.003, ori_std_deg=3.0)
             self.gripper_action = 1
             result = self.gripper_less(gripper_width, 2 * self.half_width + 0.001)
             if result == "TIMEOUT":
@@ -414,14 +419,16 @@ class Leg(Part):
             target_pos = leg_pos_robot.clone()
             target_pos[2] += 0.10
             target_ori = ee_pose[:3, :3]
-            target = self._add_noise(C.to_homogeneous(target_pos, target_ori))
+            clean_target = C.to_homogeneous(target_pos, target_ori)
+            target = self._add_noise(clean_target)
             result = self.satisfy(ee_pose, target, pos_error_threshold=0.02, ori_error_threshold=0.3, max_len=150)
             if result == "TIMEOUT":
                 timeout_failure = True
         elif state == "match_leg_ori":
             target_ori = (margin @ rot_mat_tensor(np.pi, 0, 0, device))[:3, :3]
             target_pos = torch.tensor([0.57, 0.1, 0.12], device=device)
-            target = self._add_noise(C.to_homogeneous(target_pos, target_ori))
+            clean_target = C.to_homogeneous(target_pos, target_ori)
+            target = self._add_noise(clean_target)
             result = self.satisfy(ee_pose, target, pos_error_threshold=0.02, ori_error_threshold=0.3, max_len=150)
             if result == "TIMEOUT":
                 timeout_failure = True
@@ -446,7 +453,8 @@ class Leg(Part):
                 device=device,
             )
             rel = rel_rot_mat(leg_pose_robot, target_leg_pose_robot)
-            target = self._add_noise(rel @ ee_pose, pos_std=0.003, ori_std_deg=3.0)
+            clean_target = rel @ ee_pose
+            target = self._add_noise(clean_target, pos_std=0.003, ori_std_deg=3.0)
             result = self.satisfy(ee_pose, target, pos_error_threshold=0.015, ori_error_threshold=0.3, max_len=150)
             if result == "TIMEOUT":
                 timeout_failure = True
@@ -471,7 +479,8 @@ class Leg(Part):
                 device=device,
             )
             rel = rel_rot_mat(leg_pose_robot, target_leg_pose_robot)
-            target = self._add_noise(rel @ ee_pose, pos_std=0.001, ori_std_deg=1.0)
+            clean_target = rel @ ee_pose
+            target = self._add_noise(clean_target, pos_std=0.001, ori_std_deg=1.0)
             result = self.satisfy(ee_pose, target, pos_error_threshold=0.007, ori_error_threshold=0.15, max_len=75)
             if result == "TIMEOUT":
                 timeout_failure = True
@@ -496,7 +505,8 @@ class Leg(Part):
                 device=device,
             )
             rel = rel_rot_mat(leg_pose_robot, target_leg_pose_robot)
-            target = self._add_noise(rel @ ee_pose, pos_std=0.001, ori_std_deg=1.0)
+            clean_target = rel @ ee_pose
+            target = self._add_noise(clean_target, pos_std=0.001, ori_std_deg=1.0)
             self.gripper_action = -1
             result = self.gripper_greater(
                 gripper_width,
@@ -508,7 +518,8 @@ class Leg(Part):
             target_ori = rot_mat_tensor(np.pi, 0, 0, device)[:3, :3]
             target_pos = (april_to_robot @ leg_pose[:4, 3])[:3]
             target_pos[2] += self.grasp_margin_z
-            target = self._add_noise(C.to_homogeneous(target_pos, target_ori), pos_std=0.001, ori_std_deg=1.0)
+            clean_target = C.to_homogeneous(target_pos, target_ori)
+            target = self._add_noise(clean_target, pos_std=0.001, ori_std_deg=1.0)
             self.gripper_action = -1
             result = self.gripper_greater(
                 gripper_width,
@@ -552,7 +563,8 @@ class Leg(Part):
                     print("phase 2b")
                     target_ori = rot_mat_tensor(np.pi, 0, np.pi, device)[:3, :3]
 
-            target = self._add_noise(C.to_homogeneous(target_pos, target_ori), pos_std=0.003, ori_std_deg=3.0)
+            clean_target = C.to_homogeneous(target_pos, target_ori)
+            target = self._add_noise(clean_target, pos_std=0.003, ori_std_deg=3.0)
             result = self.satisfy(ee_pose, target, max_len=300)
             if result == "TIMEOUT":
                 timeout_failure = True
@@ -570,7 +582,8 @@ class Leg(Part):
             target_pos = table_hole_pose_robot[:3, 3].clone()
             target_pos[2] = table_pose_robot[2, 3] + 0.065
             target_ori = rot_mat_tensor(np.pi, 0, np.pi, device)[:3, :3]
-            target = self._add_noise(C.to_homogeneous(target_pos, target_ori), pos_std=0.0005, ori_std_deg=1.0)
+            clean_target = C.to_homogeneous(target_pos, target_ori)
+            target = self._add_noise(clean_target, pos_std=0.0005, ori_std_deg=1.0)
             self.gripper_action = 1
             result = self.gripper_less(gripper_width, 2 * self.half_width + 0.001)
             if result == "TIMEOUT":
@@ -592,7 +605,8 @@ class Leg(Part):
                 # Phase 2b: final 90° CW (Rz: π/2 → 0) to screw target.
                 print("phase 2b")
                 target_ori = rot_mat_tensor(np.pi, 0, 0, device)[:3, :3]
-            target = self._add_noise(C.to_homogeneous(target_pos, target_ori), pos_std=0.0005, ori_std_deg=1.0)
+            clean_target = C.to_homogeneous(target_pos, target_ori)
+            target = self._add_noise(clean_target, pos_std=0.0005, ori_std_deg=1.0)
             result = self.satisfy(ee_pose, target, ori_error_threshold=0.3, max_len=75)
             if result == "TIMEOUT":
                 timeout_failure = True
@@ -602,6 +616,8 @@ class Leg(Part):
         return (
             target[:3, 3],
             C.mat2quat(target[:3, :3]),
+            clean_target[:3, 3],
+            C.mat2quat(clean_target[:3, :3]),
             torch.tensor([self.gripper_action], device=device),
             skill_complete,
             timeout_failure,

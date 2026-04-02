@@ -123,7 +123,7 @@ class DataCollector:
         while self.num_success < self.num_demos:
             # Get an action.
             if self.scripted:
-                action, skill_complete = self.env.get_assembly_action()
+                action, _, skill_complete = self.env.get_assembly_action()
                 pos_bounds_m = 0.02 if self.env.ctrl_mode == 'diffik' else 0.025
                 ori_bounds_deg = 15 if self.env.ctrl_mode == 'diffik' else 20
                 action = scale_scripted_action(

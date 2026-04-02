@@ -151,7 +151,7 @@ def main():
     elif args.scripted:
         # Execute hard-coded assembly script.
         while not done:
-            action, skill_complete = env.get_assembly_action()
+            action, _, skill_complete = env.get_assembly_action()
             action = action_tensor(action)
             ob, rew, done, _ = env.step(action)
     elif args.replay_path:

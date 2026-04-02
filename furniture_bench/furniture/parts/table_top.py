@@ -182,9 +182,11 @@ class TableTop(Part):
 
         # Default target: stay at current EE pose
         target = ee_pose.clone()
+        clean_target = ee_pose.clone()
 
         if state == "reach_body_grasp_xy":
-            target = self._add_noise(self._get_grasp_target(body_pose_april, april_to_robot, ee_pos, device))
+            clean_target = self._get_grasp_target(body_pose_april, april_to_robot, ee_pos, device)
+            target = self._add_noise(clean_target)
             result = self.satisfy(ee_pose, target, max_len=300)
             if result == "TIMEOUT":
                 timeout_failure = True
@@ -194,8 +196,9 @@ class TableTop(Part):
             target_pos = grasp_target[:3, 3].clone()
             target_pos[2] = body_pose_robot[2, 3]
             target_ori = grasp_target[:3, :3]
+            clean_target = C.to_homogeneous(target_pos, target_ori)
             target = self._add_noise(
-                C.to_homogeneous(target_pos, target_ori),
+                clean_target,
                 pos_std=0.005,  # slightly larger noise for Z approach (original: [0.01, 0.01, 0.001])
             )
             result = self.satisfy(ee_pose, target, max_len=150)
@@ -207,27 +210,23 @@ class TableTop(Part):
             target_pos = grasp_target[:3, 3].clone()
             target_pos[2] = body_pose_robot[2, 3]
             target_ori = grasp_target[:3, :3]
-            target = self._add_noise(C.to_homogeneous(target_pos, target_ori), pos_std=0.003, ori_std_deg=3.0)
+            clean_target = C.to_homogeneous(target_pos, target_ori)
+            target = self._add_noise(clean_target, pos_std=0.003, ori_std_deg=3.0)
             self.gripper_action = 1
             result = self.gripper_less(gripper_width, self.body_grip_width)
             if result == "TIMEOUT":
                 timeout_failure = True
 
         elif state == "push":
-            target = self._add_noise(
-                self._get_push_target(rb_states, part_idxs, sim_to_april_mat, april_to_robot, ee_pose, device),
-                pos_std=0.003,
-            )
+            clean_target = self._get_push_target(rb_states, part_idxs, sim_to_april_mat, april_to_robot, ee_pose, device)
+            target = self._add_noise(clean_target, pos_std=0.003)
             result = self.satisfy(ee_pose, target, pos_error_threshold=0.02, ori_error_threshold=0.5, max_len=300)
             if result == "TIMEOUT":
                 timeout_failure = True
 
         elif state == "release":
-            target = self._add_noise(
-                self._get_push_target(rb_states, part_idxs, sim_to_april_mat, april_to_robot, ee_pose, device),
-                pos_std=0.003,
-                ori_std_deg=3.0,
-            )
+            clean_target = self._get_push_target(rb_states, part_idxs, sim_to_april_mat, april_to_robot, ee_pose, device)
+            target = self._add_noise(clean_target, pos_std=0.003, ori_std_deg=3.0)
             self.gripper_action = -1
             result = self.gripper_greater(
                 gripper_width,
@@ -241,7 +240,8 @@ class TableTop(Part):
             target_pos = push_target[:3, 3].clone()
             target_pos[2] = 0.1
             target_ori = push_target[:3, :3]
-            target = self._add_noise(C.to_homogeneous(target_pos, target_ori))
+            clean_target = C.to_homogeneous(target_pos, target_ori)
+            target = self._add_noise(clean_target)
             result = self.satisfy(ee_pose, target, max_len=150)
             if result == "TIMEOUT":
                 timeout_failure = True
@@ -252,13 +252,16 @@ class TableTop(Part):
             target_pos = push_target[:3, 3].clone()
             target_pos[2] = 0.1
             target_ori = push_target[:3, :3]
-            target = self._add_noise(C.to_homogeneous(target_pos, target_ori), pos_std=0.003, ori_std_deg=3.0)
+            clean_target = C.to_homogeneous(target_pos, target_ori)
+            target = self._add_noise(clean_target, pos_std=0.003, ori_std_deg=3.0)
             self.gripper_action = -1
 
         skill_complete = self.state_transition_handler(self._last_state, state)
         return (
             target[:3, 3],
             C.mat2quat(target[:3, :3]),
+            clean_target[:3, 3],
+            C.mat2quat(clean_target[:3, :3]),
             torch.tensor([self.gripper_action], device=device),
             skill_complete,
             timeout_failure,

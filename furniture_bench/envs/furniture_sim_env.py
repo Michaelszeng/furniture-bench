@@ -127,6 +127,7 @@ class FurnitureSimEnv(gym.Env):
         self.manual_done = manual_done
         self.headless = headless
         self.ctrl_started = False
+        self._image_access_started = False
         self.init_assembled = init_assembled
         self.np_step_out = np_step_out
         self.channel_first = channel_first
@@ -806,6 +807,7 @@ class FurnitureSimEnv(gym.Env):
                 self.isaac_gym.clear_lines(self.viewer)
 
         self.isaac_gym.end_access_image_tensors(self.sim)
+        self._image_access_started = False
 
         obs = self._get_observation()
         self.env_steps += 1
@@ -952,7 +954,10 @@ class FurnitureSimEnv(gym.Env):
         self.isaac_gym.refresh_jacobian_tensors(self.sim)
         self.isaac_gym.refresh_mass_matrix_tensors(self.sim)
         self.isaac_gym.render_all_camera_sensors(self.sim)
+        if self._image_access_started:
+            self.isaac_gym.end_access_image_tensors(self.sim)
         self.isaac_gym.start_access_image_tensors(self.sim)
+        self._image_access_started = True
 
     def init_ctrl(self):
         # Positional and velocity gains for robot control.
@@ -1394,7 +1399,9 @@ class FurnitureSimEnv(gym.Env):
         Scripted furniture assembly logic (Markovian: all state inferred from env).
 
         Returns:
-            Tuple (action for the assembly task, skill complete mask)
+            Tuple (noisy_action, clean_action, skill_complete_mask) where noisy_action
+            is what gets executed in the environment and clean_action is the pure action
+            without any added noise (suitable for recording in a dataset).
         """
         assert self.num_envs == 1  # Only support one environment for now.
         if self.furniture_name not in ["one_leg", "cabinet", "lamp", "round_table"]:
@@ -1420,13 +1427,11 @@ class FurnitureSimEnv(gym.Env):
                 delta_pos = goal_pos - ee_pos
                 delta_quat = torch.tensor([0, 0, 0, 1], device=self.device)
                 action = torch.concat([delta_pos, delta_quat, gripper])
-                return action.unsqueeze(0), 0
+                return action.unsqueeze(0), action.unsqueeze(0), 0
             else:
                 # All assembled and EE is high: done
-                return (
-                    torch.tensor([0, 0, 0, 0, 0, 0, 1, -1], dtype=torch.float32, device=self.device).unsqueeze(0),
-                    1,
-                )
+                action = torch.tensor([0, 0, 0, 0, 0, 0, 1, -1], dtype=torch.float32, device=self.device).unsqueeze(0)
+                return action, action, 1
 
         # Get next pair of parts to assemble
         part_idx1, part_idx2 = self.furniture.should_be_assembled[assemble_idx]
@@ -1438,9 +1443,10 @@ class FurnitureSimEnv(gym.Env):
         part2_pre_assemble_done = not hasattr(part2, "compute_pre_assemble_state") or part2.pre_assemble_done
 
         timeout_failure = False
+        clean_goal_pos = clean_goal_ori = None
         if not part1_pre_assemble_done:
             print(f"[green][ENV][/green] pre-assembling part1={part1.name}")
-            goal_pos, goal_ori, gripper, skill_complete, timeout_failure = part1.pre_assemble(
+            pre_result = part1.pre_assemble(
                 ee_pos,
                 ee_quat,
                 gripper_width,
@@ -1449,9 +1455,16 @@ class FurnitureSimEnv(gym.Env):
                 self.sim_to_april_mat,
                 self.april_to_robot_mat,
             )
+            if len(pre_result) == 7:
+                goal_pos, goal_ori, clean_goal_pos, clean_goal_ori, gripper, skill_complete, timeout_failure = (
+                    pre_result
+                )
+            else:
+                goal_pos, goal_ori, gripper, skill_complete, timeout_failure = pre_result
+                clean_goal_pos, clean_goal_ori = goal_pos, goal_ori
         elif not part2_pre_assemble_done:
             print(f"[green][ENV][/green] pre-assembling part2={part2.name}")
-            goal_pos, goal_ori, gripper, skill_complete, timeout_failure = part2.pre_assemble(
+            pre_result = part2.pre_assemble(
                 ee_pos,
                 ee_quat,
                 gripper_width,
@@ -1460,9 +1473,16 @@ class FurnitureSimEnv(gym.Env):
                 self.sim_to_april_mat,
                 self.april_to_robot_mat,
             )
+            if len(pre_result) == 7:
+                goal_pos, goal_ori, clean_goal_pos, clean_goal_ori, gripper, skill_complete, timeout_failure = (
+                    pre_result
+                )
+            else:
+                goal_pos, goal_ori, gripper, skill_complete, timeout_failure = pre_result
+                clean_goal_pos, clean_goal_ori = goal_pos, goal_ori
         else:
             print(f"[green][ENV][/green] fsm_step part2={part2.name}, assemble_to={part1.name}")
-            goal_pos, goal_ori, gripper, skill_complete, timeout_failure = part2.fsm_step(
+            fsm_result = part2.fsm_step(
                 ee_pos,
                 ee_quat,
                 gripper_width,
@@ -1473,6 +1493,13 @@ class FurnitureSimEnv(gym.Env):
                 self.furniture.parts[part_idx1].name,
                 ee_ang_vel=ee_ang_vel,
             )
+            if len(fsm_result) == 7:
+                goal_pos, goal_ori, clean_goal_pos, clean_goal_ori, gripper, skill_complete, timeout_failure = (
+                    fsm_result
+                )
+            else:  # Backward compatibility for older parts that don't return clean goal
+                goal_pos, goal_ori, gripper, skill_complete, timeout_failure = fsm_result
+                clean_goal_pos, clean_goal_ori = goal_pos, goal_ori
 
         if timeout_failure:
             print("[green][ENV][/green] scripted_timeout triggered — marking episode as failure")
@@ -1480,29 +1507,38 @@ class FurnitureSimEnv(gym.Env):
             zero_action = torch.zeros(8, dtype=torch.float32, device=self.device)
             zero_action[6] = 1  # qw=1 (identity quaternion)
             zero_action[7] = -1  # gripper open
-            return zero_action.unsqueeze(0), 0
+            zero_action = zero_action.unsqueeze(0)
+            return zero_action, zero_action, 0
 
-        # Compute delta position between goal position and current EE position
+        # Compute noisy delta position from (noisy) goal
         delta_pos = goal_pos - ee_pos
-
-        # Scale translational action
         delta_pos_sign = delta_pos.sign()
         delta_pos = torch.abs(delta_pos) * 2  # 2x delta pos gain
-        # If delta is large enough, add random "kick"/scale to the action
         for i in range(3):
             if delta_pos[i] > 0.03:
                 delta_pos[i] = 0.03 + (delta_pos[i] - 0.03) * np.random.normal(1.5, 0.1)
         delta_pos = delta_pos * delta_pos_sign
-
-        # Clamp too large action; the max value is 0.11 + 0.01 * random noise
         max_delta_pos = 0.11 + 0.01 * torch.rand(3, device=self.device)
-        max_delta_pos[2] -= 0.04  # Make z-limit 0.4 smaller
+        max_delta_pos[2] -= 0.04
         delta_pos = torch.clamp(delta_pos, min=-max_delta_pos, max=max_delta_pos)
-
         delta_quat = C.quat_mul(C.quat_conjugate(ee_quat), goal_ori)
 
-        # Randomly choose to add random noise to the action (50% chance)
-        if self.furniture.parts[part_idx2].state_no_noise() and np.random.random() < 0.50:
+        # Compute clean delta position from clean goal (deterministic — no random kick or clamp noise)
+        clean_delta_pos = clean_goal_pos - ee_pos
+        clean_delta_pos_sign = clean_delta_pos.sign()
+        clean_delta_pos = torch.abs(clean_delta_pos) * 2
+        for i in range(3):
+            if clean_delta_pos[i] > 0.03:
+                clean_delta_pos[i] = 0.03 + (clean_delta_pos[i] - 0.03) * 1.5  # deterministic scale
+        clean_delta_pos = clean_delta_pos * clean_delta_pos_sign
+        clean_max_delta_pos = torch.tensor([0.11, 0.11, 0.07], device=self.device)
+        clean_delta_pos = torch.clamp(clean_delta_pos, min=-clean_max_delta_pos, max=clean_max_delta_pos)
+        clean_delta_quat = C.quat_mul(C.quat_conjugate(ee_quat), clean_goal_ori)
+
+        clean_action = torch.concat([clean_delta_pos, clean_delta_quat, gripper])
+
+        # Randomly choose to add random noise to the action
+        if self.furniture.parts[part_idx2].state_no_noise():
             delta_pos = torch.normal(delta_pos, 0.005)
             delta_quat = C.quat_multiply(
                 delta_quat,
@@ -1518,8 +1554,8 @@ class FurnitureSimEnv(gym.Env):
                 ),
             ).to(self.device)
 
-        action = torch.concat([delta_pos, delta_quat, gripper])
-        return action.unsqueeze(0), skill_complete
+        noisy_action = torch.concat([delta_pos, delta_quat, gripper])
+        return noisy_action.unsqueeze(0), clean_action.unsqueeze(0), skill_complete
 
     def assembly_success(self):
         return self._done().squeeze()
