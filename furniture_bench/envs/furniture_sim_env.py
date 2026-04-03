@@ -197,6 +197,9 @@ class FurnitureSimEnv(gym.Env):
         self.robot_state_as_dict = kwargs.get("robot_state_as_dict", True)
         self.squeeze_batch_dim = kwargs.get("squeeze_batch_dim", False)
 
+        self.delta_pos_gain = 2.5  # Scales goal-error → delta_pos action; halved during soft states.
+        self.delta_quat_gain = 1.0  # Slerp fraction for delta_quat; halved during soft states.
+
     def _create_ground_plane(self):
         """Creates ground plane."""
         plane_params = gymapi.PlaneParams()
@@ -733,8 +736,8 @@ class FurnitureSimEnv(gym.Env):
                     step_ctrl = self.diffik_ctrls[env_idx]
                 step_ctrl.set_goal(action[env_idx][:3], action_quat.to(self.device))
 
-        for _ in range(self.sim_steps):
-            self.refresh()
+        for _substep in range(self.sim_steps):
+            self.refresh(render_cameras=(_substep == self.sim_steps - 1))
 
             if self.ee_laser:
                 # draw lines
@@ -801,9 +804,9 @@ class FurnitureSimEnv(gym.Env):
                 self.isaac_gym.set_dof_actuation_force_tensor(self.sim, gymtorch.unwrap_tensor(torque_action))
 
             # Update viewer
-            if not self.headless:
+            if not self.headless and _substep == self.sim_steps - 1:
                 self.isaac_gym.draw_viewer(self.viewer, self.sim, False)
-                self.isaac_gym.sync_frame_time(self.sim)
+                # self.isaac_gym.sync_frame_time(self.sim)
                 self.isaac_gym.clear_lines(self.viewer)
 
         self.isaac_gym.end_access_image_tensors(self.sim)
@@ -942,22 +945,26 @@ class FurnitureSimEnv(gym.Env):
         }
         return {k: robot_state_dict[k] for k in self.robot_state_keys}
 
-    def refresh(self):
+    def refresh(self, render_cameras: bool = True):
         self.isaac_gym.simulate(self.sim)
         self.isaac_gym.fetch_results(self.sim, True)
         self.isaac_gym.step_graphics(self.sim)
 
-        # Refresh tensors.
+        # Refresh tensors (needed every substep for the OSC/DiffIK controller).
         self.isaac_gym.refresh_dof_state_tensor(self.sim)
         self.isaac_gym.refresh_dof_force_tensor(self.sim)
         self.isaac_gym.refresh_rigid_body_state_tensor(self.sim)
         self.isaac_gym.refresh_jacobian_tensors(self.sim)
         self.isaac_gym.refresh_mass_matrix_tensors(self.sim)
-        self.isaac_gym.render_all_camera_sensors(self.sim)
-        if self._image_access_started:
-            self.isaac_gym.end_access_image_tensors(self.sim)
-        self.isaac_gym.start_access_image_tensors(self.sim)
-        self._image_access_started = True
+
+        # Camera rendering is expensive — skip on intermediate substeps since only
+        # the final frame is read as an observation.
+        if render_cameras:
+            self.isaac_gym.render_all_camera_sensors(self.sim)
+            if self._image_access_started:
+                self.isaac_gym.end_access_image_tensors(self.sim)
+            self.isaac_gym.start_access_image_tensors(self.sim)
+            self._image_access_started = True
 
     def init_ctrl(self):
         # Positional and velocity gains for robot control.
@@ -1510,10 +1517,20 @@ class FurnitureSimEnv(gym.Env):
             zero_action = zero_action.unsqueeze(0)
             return zero_action, zero_action, 0
 
+        # Reduce gains during "screw" so both the recorded actions and the OSC
+        # goal steps are smaller/softer; restore defaults for all other states.
+        if hasattr(part2, "_last_state"):
+            if part2._last_state == "screw":
+                self.delta_pos_gain = 4.0
+                self.delta_quat_gain = 1.0
+            else:
+                self.delta_pos_gain = 2.5
+                self.delta_quat_gain = 1.0
+
         # Compute noisy delta position from (noisy) goal
         delta_pos = goal_pos - ee_pos
         delta_pos_sign = delta_pos.sign()
-        delta_pos = torch.abs(delta_pos) * 2  # 2x delta pos gain
+        delta_pos = torch.abs(delta_pos) * self.delta_pos_gain
         for i in range(3):
             if delta_pos[i] > 0.03:
                 delta_pos[i] = 0.03 + (delta_pos[i] - 0.03) * np.random.normal(1.5, 0.1)
@@ -1522,11 +1539,13 @@ class FurnitureSimEnv(gym.Env):
         max_delta_pos[2] -= 0.04
         delta_pos = torch.clamp(delta_pos, min=-max_delta_pos, max=max_delta_pos)
         delta_quat = C.quat_mul(C.quat_conjugate(ee_quat), goal_ori)
+        identity_quat = torch.tensor([0.0, 0.0, 0.0, 1.0], device=self.device)
+        delta_quat = C.quat_slerp(identity_quat, delta_quat, self.delta_quat_gain)
 
         # Compute clean delta position from clean goal (deterministic — no random kick or clamp noise)
         clean_delta_pos = clean_goal_pos - ee_pos
         clean_delta_pos_sign = clean_delta_pos.sign()
-        clean_delta_pos = torch.abs(clean_delta_pos) * 2
+        clean_delta_pos = torch.abs(clean_delta_pos) * self.delta_pos_gain
         for i in range(3):
             if clean_delta_pos[i] > 0.03:
                 clean_delta_pos[i] = 0.03 + (clean_delta_pos[i] - 0.03) * 1.5  # deterministic scale
@@ -1534,6 +1553,7 @@ class FurnitureSimEnv(gym.Env):
         clean_max_delta_pos = torch.tensor([0.11, 0.11, 0.07], device=self.device)
         clean_delta_pos = torch.clamp(clean_delta_pos, min=-clean_max_delta_pos, max=clean_max_delta_pos)
         clean_delta_quat = C.quat_mul(C.quat_conjugate(ee_quat), clean_goal_ori)
+        clean_delta_quat = C.quat_slerp(identity_quat, clean_delta_quat, self.delta_quat_gain)
 
         clean_action = torch.concat([clean_delta_pos, clean_delta_quat, gripper])
 

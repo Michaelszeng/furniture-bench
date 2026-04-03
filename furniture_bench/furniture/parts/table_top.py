@@ -107,10 +107,10 @@ class TableTop(Part):
         )
         push_target = self._get_push_target(rb_states, part_idxs, sim_to_april_mat, april_to_robot, ee_pose, device)
 
-        gripper_open_thr = config["robot"]["max_gripper_width"]["square_table"] - 0.025
+        gripper_open_thr = config["robot"]["max_gripper_width"]["square_table"] - 0.005
 
         push_xy = push_target[:2, 3]
-        at_push_xy = (ee_pos[:2] - push_xy).abs().sum() < self.pos_error_threshold * 2
+        at_push_xy = (ee_pos[:2] - push_xy).abs().sum() < self.pos_error_threshold * 2.5
 
         # Whether the table body has been physically pushed near the push target.
         # This prevents "done"/"go_up" from firing at episode start when the EE happens
@@ -145,7 +145,7 @@ class TableTop(Part):
             return "pick_body"
 
         # "reach_body_grasp_z": EE at body XY, needs to descend to body Z
-        if (ee_pos[:2] - grasp_xy).abs().sum() < self.pos_error_threshold * 2:
+        if (ee_pos[:2] - grasp_xy).abs().sum() < self.pos_error_threshold * 4:
             return "reach_body_grasp_z"
 
         return "reach_body_grasp_xy"
@@ -196,6 +196,7 @@ class TableTop(Part):
             target_pos = grasp_target[:3, 3].clone()
             target_pos[2] = body_pose_robot[2, 3]
             target_ori = grasp_target[:3, :3]
+
             clean_target = C.to_homogeneous(target_pos, target_ori)
             target = self._add_noise(
                 clean_target,
@@ -218,14 +219,18 @@ class TableTop(Part):
                 timeout_failure = True
 
         elif state == "push":
-            clean_target = self._get_push_target(rb_states, part_idxs, sim_to_april_mat, april_to_robot, ee_pose, device)
-            target = self._add_noise(clean_target, pos_std=0.003)
+            clean_target = self._get_push_target(
+                rb_states, part_idxs, sim_to_april_mat, april_to_robot, ee_pose, device
+            )
+            target = self._add_noise(clean_target, pos_std=0.001)
             result = self.satisfy(ee_pose, target, pos_error_threshold=0.02, ori_error_threshold=0.5, max_len=300)
             if result == "TIMEOUT":
                 timeout_failure = True
 
         elif state == "release":
-            clean_target = self._get_push_target(rb_states, part_idxs, sim_to_april_mat, april_to_robot, ee_pose, device)
+            clean_target = self._get_push_target(
+                rb_states, part_idxs, sim_to_april_mat, april_to_robot, ee_pose, device
+            )
             target = self._add_noise(clean_target, pos_std=0.003, ori_std_deg=3.0)
             self.gripper_action = -1
             result = self.gripper_greater(

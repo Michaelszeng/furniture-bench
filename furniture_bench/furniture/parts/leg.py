@@ -38,6 +38,54 @@ class Leg(Part):
         self._last_state = "reach_leg_floor_xy"
         self.gripper_action = -1
         self.screw_mode = "standard"  # latent variable: "standard" or "alternate" (-90° Z offset)
+        self.latent_offsets = {}  # per-state 3D position offsets, empty = no latent plan
+
+    def apply_non_markovian_config(self):
+        """Sample episode-level non-Markovian latent variables."""
+        import random
+
+        import numpy as np
+
+        self.screw_mode = random.choice(["standard", "alternate"])
+
+        # States that require positional precision get small offsets; all others get large offsets.
+        PRECISION_STATES = {"reach_leg_floor_z", "reach_table_top_z", "screw_grasp", "screw"}
+        HIGH_STD = 0.020  # m — persistent offset for coarse-motion states
+        LOW_STD = 0.003  # m — persistent offset for precision states
+
+        all_states = [
+            "reach_leg_floor_xy",
+            "reach_leg_ori",
+            "reach_leg_floor_z",
+            "pick_leg",
+            "lift_up",
+            "match_leg_ori",
+            "reach_table_top_xy",
+            "reach_table_top_z",
+            "insert_release",
+            "release",
+            "pre_screw",
+            "screw_grasp",
+            "screw",
+        ]
+        self.latent_offsets = {
+            state: np.random.normal(0, LOW_STD if state in PRECISION_STATES else HIGH_STD, size=(3,))
+            for state in all_states
+        }
+
+    def _apply_latent_offset(self, state: str, clean_target):
+        """
+        Add the episode-level latent position offset to clean_target[:3, 3].
+        If self.latent_offsets is not set, no-op.
+        """
+        if not self.latent_offsets:
+            return clean_target
+        offset = self.latent_offsets.get(state)
+        if offset is None:
+            return clean_target
+        clean_target = clean_target.clone()
+        clean_target[:3, 3] += torch.tensor(offset, device=clean_target.device, dtype=clean_target.dtype)
+        return clean_target
 
     def is_in_reset_ori(self, pose: npt.NDArray[np.float32], from_skill, ori_bound) -> bool:
         # y-axis of the leg align with y-axis of the base.
@@ -76,25 +124,22 @@ class Leg(Part):
         """
         device = ee_pos.device
 
-        def rot_mat_tensor(x, y, z):
-            return torch.tensor(rot_mat([x, y, z], hom=True), device=device).float()
-
-        ee_pose = C.to_homogeneous(ee_pos, C.quat2mat(ee_quat))
+        ee_pose = C.to_homogeneous(ee_pos, C.quat2mat(ee_quat))  # EE Pose in robot base frame
         table_pose = C.to_homogeneous(
             rb_states[part_idxs[assemble_to]][0][:3],
             C.quat2mat(rb_states[part_idxs[assemble_to]][0][3:7]),
-        )
+        )  # TEMPORARY: Table pose in world frame
         leg_pose = C.to_homogeneous(
             rb_states[part_idxs[self.name]][0][:3],
             C.quat2mat(rb_states[part_idxs[self.name]][0][3:7]),
-        )
-        table_pose = sim_to_april_mat @ table_pose
-        leg_pose = sim_to_april_mat @ leg_pose
+        )  # TEMPORARY: Leg pose in world frame
+        table_pose = sim_to_april_mat @ table_pose  # Table pose in robot base frame
+        leg_pose = sim_to_april_mat @ leg_pose  # Leg pose in robot base frame
 
         table_pose_robot = april_to_robot @ table_pose
         leg_pose_robot = april_to_robot @ leg_pose
 
-        # Table hole position in robot frame
+        # Table hole pose in robot base frame
         table_hole_pose_robot = (
             april_to_robot
             @ table_pose
@@ -106,8 +151,7 @@ class Leg(Part):
         table_hole_pos_robot = table_hole_pose_robot[:3, 3]
 
         # Top-level phase discriminators
-        leg_xy_near_hole = (leg_pose_robot[:2, 3] - table_hole_pos_robot[:2]).abs().sum() < 0.04
-        ee_xy_near_hole = (ee_pos[:2] - table_hole_pos_robot[:2]).abs().sum() < 0.02
+        leg_xy_near_hole = (leg_pose_robot[:2, 3] - table_hole_pos_robot[:2]).abs().sum() < 0.015
         # gripper_grasped: leg is physically between the fingers.
         # When the leg (diameter = 2*half_width) is held, physics prevents the gripper
         # from closing below 2*half_width, so the reading stays near that value.
@@ -122,7 +166,7 @@ class Leg(Part):
         )
 
         # Precompute orientations
-        margin = rot_mat_tensor(0, -np.pi / 5, 0)  # Ry(-36 deg)
+        margin = C.rot_mat_tensor(0, -np.pi / 5, 0, device)  # Ry(-36 deg)
         # grasp_ori: base floor-pickup orientation rotated around world-Z to match the
         # leg's current yaw (same logic as floor_grasp_ori() in fsm_step).
         #
@@ -137,7 +181,7 @@ class Leg(Part):
         _theta = (_leg_long_yaw - _default_long_yaw).item()
         # Wrap to [-π/2, π/2]: 180° symmetry (leg can be grasped from either perpendicular side).
         _theta_wrapped = ((float(_theta) + np.pi / 2) % np.pi) - np.pi / 2
-        _grasp_base = (margin @ april_to_robot @ rot_mat_tensor(np.pi / 2, -np.pi / 2, 0))[:3, :3]
+        _grasp_base = (margin @ april_to_robot @ C.rot_mat_tensor(np.pi / 2, -np.pi / 2, 0, device))[:3, :3]
         _Rz = torch.tensor(
             [
                 [np.cos(_theta_wrapped), -np.sin(_theta_wrapped), 0.0],
@@ -148,21 +192,21 @@ class Leg(Part):
             dtype=torch.float32,
         )
         grasp_ori = _Rz @ _grasp_base
-        insert_ori = (margin @ rot_mat_tensor(np.pi, 0, 0))[
+        insert_ori = (margin @ C.rot_mat_tensor(np.pi, 0, 0, device))[
             :3, :3
         ]  # Ry(-36°) @ Rx(180°) — matches match_leg_ori target
         table_top_z = table_pose_robot[2, 3]
-        insert_z = table_top_z + 0.0625
+        insert_z = table_top_z + 0.056
 
         # Hard-coded INSERTED-phase orientations (mode-dependent).
         # Standard:  pre_screw = Rx(π)@Rz(π),   screw_done = Rx(π)           (−180° around Z)
         # Alternate: pre_screw = Rx(π)@Rz(π/2), screw_done = Rx(π)@Rz(−π/2) (same arc, −90° offset)
         if self.screw_mode == "alternate":
-            pre_screw_ori = rot_mat_tensor(np.pi, 0, np.pi / 2)[:3, :3]
-            screw_ori = rot_mat_tensor(np.pi, 0, -np.pi / 2)[:3, :3]
+            pre_screw_ori = C.rot_mat_tensor(np.pi, 0, np.pi / 2, device)[:3, :3]
+            screw_ori = C.rot_mat_tensor(np.pi, 0, -np.pi / 2, device)[:3, :3]
         else:
-            pre_screw_ori = rot_mat_tensor(np.pi, 0, np.pi)[:3, :3]
-            screw_ori = rot_mat_tensor(np.pi, 0, 0)[:3, :3]
+            pre_screw_ori = C.rot_mat_tensor(np.pi, 0, np.pi, device)[:3, :3]
+            screw_ori = C.rot_mat_tensor(np.pi, 0, 0, device)[:3, :3]
 
         # Stable pre-screw position: table hole XY + insert_z height.
         # Using the stable table reference (not the bouncing leg) avoids the EE chasing
@@ -174,7 +218,7 @@ class Leg(Part):
         # ── Phase 1: GRASPED ─────────────────────────────────────────────────
         # Primary discriminator: leg is physically between the gripper fingers.
         if gripper_grasped:
-            if ee_xy_near_hole or leg_xy_near_hole:
+            if leg_xy_near_hole:
                 # ── Screw vs Insertion sub-phase ─────────────────────────────
                 # Both "carrying the leg down for insertion" and "re-grasped for screwing"
                 # share the same XY proximity to the hole.  The EE orientation is the discriminator:
@@ -184,7 +228,10 @@ class Leg(Part):
                 if ee_at_insert_ori:
                     # ── Insertion sub-phase ──────────────────────────────────
                     # EE is at insert_ori, descending to insert the leg.
-                    if ee_pos[2] < insert_z:  # fully inserted → release the leg
+                    print(
+                        f"leg_pose_robot[2, 3] - table_pose_robot[2, 3]: {leg_pose_robot[2, 3] - table_pose_robot[2, 3]}"
+                    )
+                    if leg_pose_robot[2, 3] - table_pose_robot[2, 3] < 0.056:  # fully inserted → release the leg
                         return "insert_release"
                     return "reach_table_top_z"  # descending to insert the leg
 
@@ -192,7 +239,7 @@ class Leg(Part):
                     # ── Screw sub-phase ──────────────────────────────────────
                     # EE is rotating from pre_screw_ori toward screw_ori.
                     # screwing complete (EE has rotated to screw_ori) → release
-                    if (ee_pose[:3, :3] - screw_ori).abs().sum() < self.ori_error_threshold * 2:
+                    if (ee_pose[:3, :3] - screw_ori).abs().sum() < self.ori_error_threshold * 1.5:
                         return "release"
                     return "screw"
 
@@ -203,7 +250,7 @@ class Leg(Part):
 
                 # "reach_table_top_xy": EE orientation already matches insert_ori
                 # (Ry(-36°) @ Rx(180°)) → fly EE XY to the hole position.
-                if (ee_pose[:3, :3] - insert_ori).abs().sum() < self.ori_error_threshold * 2:
+                if (ee_pose[:3, :3] - insert_ori).abs().sum() < self.ori_error_threshold * 3:
                     return "reach_table_top_xy"
 
                 # "match_leg_ori": leg is lifted (Z > 0.05 m) → move to the
@@ -223,7 +270,7 @@ class Leg(Part):
             d_from_pre_screw = (ee_pose[:3, :3] - pre_screw_ori).abs().sum()
 
             # "screw_grasp": at pre_screw_ori AND at position → close gripper.
-            if d_from_pre_screw < self.ori_error_threshold * 1.25 and at_pre_screw_pos:
+            if d_from_pre_screw < self.ori_error_threshold * 1.5 and at_pre_screw_pos:
                 return "screw_grasp"
 
             # "pre_screw": move to table hole position and rotate to pre_screw_ori.
@@ -241,9 +288,9 @@ class Leg(Part):
             leg_z = leg_pose_robot[2, 3]
 
             # Gate on XY proximity between EE and leg.
-            if (ee_pos[:2] - leg_xy).abs().sum() < self.pos_error_threshold * 3:
+            if (ee_pos[:2] - leg_xy).abs().sum() < self.pos_error_threshold * 4:
                 # Gate on orientation alignment between EE and leg.
-                if (ee_pose[:3, :3] - grasp_ori).abs().sum() < self.ori_error_threshold:
+                if (ee_pose[:3, :3] - grasp_ori).abs().sum() < self.ori_error_threshold * 1.5:
                     # Gate on Z proximity between EE and leg.
                     if abs(ee_pos[2] - leg_z) < self.pos_error_threshold * 2:
                         return "pick_leg"  # Ready to pick up the leg.
@@ -266,9 +313,6 @@ class Leg(Part):
         assemble_to,
         ee_ang_vel=None,
     ):
-        def rot_mat_tensor(x, y, z, device):
-            return torch.tensor(rot_mat([x, y, z], hom=True), device=device).float()
-
         def rel_rot_mat(s, t):
             s_inv = torch.linalg.inv(s)
             return t @ s_inv
@@ -289,7 +333,7 @@ class Leg(Part):
             theta = (leg_long_yaw - default_long_yaw).item()
             # Wrap to [-π/2, π/2]: 180° symmetry.
             theta_wrapped = ((float(theta) + np.pi / 2) % np.pi) - np.pi / 2
-            base = (margin @ april_to_robot @ rot_mat_tensor(np.pi / 2, -np.pi / 2, 0, device))[:3, :3]
+            base = (margin @ april_to_robot @ C.rot_mat_tensor(np.pi / 2, -np.pi / 2, 0, device))[:3, :3]
             c_d, s_d = np.cos(theta_wrapped), np.sin(theta_wrapped)
             Rz = torch.tensor(
                 [[c_d, -s_d, 0.0], [s_d, c_d, 0.0], [0.0, 0.0, 1.0]],
@@ -333,13 +377,13 @@ class Leg(Part):
         table_pose = sim_to_april_mat @ table_pose
         leg_pose = sim_to_april_mat @ leg_pose
 
-        margin = rot_mat_tensor(0, -np.pi / 5, 0, ee_pose.device)
+        margin = C.rot_mat_tensor(0, -np.pi / 5, 0, ee_pose.device)
         device = ee_pose.device
 
         def find_leg_pose_x_look_front(leg_pose):
             best_leg_pose = leg_pose.clone()
             tmp_leg_pose = leg_pose
-            rot = rot_mat_tensor(0, -np.pi / 2, 0, device)
+            rot = C.rot_mat_tensor(0, -np.pi / 2, 0, device)
             for i in range(3):
                 tmp_leg_pose = tmp_leg_pose @ rot
                 if best_leg_pose[0, 0] < tmp_leg_pose[0, 0]:
@@ -369,9 +413,11 @@ class Leg(Part):
             R_z_delta[1, 1] = c
             target_ori = R_z_delta @ ee_pose[:3, :3]
             target_pos[2] = ee_pos[2]
-            target_pos[1] += 0.01
-            target_pos[0] += self.grasp_margin_x
+            # target_pos[1] += 0.01
+            print(f"grasp_margin_x: {0.005}")
+            target_pos[0] += 0.005
             clean_target = C.to_homogeneous(target_pos, target_ori)
+            clean_target = self._apply_latent_offset(state, clean_target)
             target = self._add_noise(clean_target, pos_std=0.005, ori_std_deg=5.0)
             # Large XY motion from neutral to leg (can be 10-15 cm); needs many steps.
             result = self.satisfy(ee_pose, target, pos_error_threshold=0.02, max_len=150)
@@ -383,10 +429,11 @@ class Leg(Part):
             leg_pos_robot = (april_to_robot @ leg_pose_down[:4, 3])[:3]
             target_pos = leg_pos_robot.clone()
             target_pos[2] = ee_pos[2]
-            target_pos[1] += 0.01
-            target_pos[0] += self.grasp_margin_x
+            # target_pos[1] += 0.01
+            target_pos[0] += 0.005
             target_pos[2] -= 0.005
             clean_target = C.to_homogeneous(target_pos, target_ori)
+            clean_target = self._apply_latent_offset(state, clean_target)
             target = self._add_noise(clean_target, pos_std=0.003, ori_std_deg=3.0)
             result = self.satisfy(ee_pose, target, pos_error_threshold=0.015, ori_error_threshold=0.1, max_len=150)
             if result == "TIMEOUT":
@@ -396,10 +443,11 @@ class Leg(Part):
             target_ori = floor_grasp_ori(leg_pose_down)
             leg_pos_robot = (april_to_robot @ leg_pose_down[:4, 3])[:3]
             target_pos = leg_pos_robot.clone()
-            target_pos[1] += 0.01
-            target_pos[0] += self.grasp_margin_x
+            # target_pos[1] += 0.01
+            target_pos[0] += 0.005
             target_pos[2] = (april_to_robot @ leg_pose)[2, 3]
             clean_target = C.to_homogeneous(target_pos, target_ori)
+            clean_target = self._apply_latent_offset(state, clean_target)
             target = self._add_noise(clean_target, pos_std=0.0015, ori_std_deg=1.5)
             result = self.satisfy(ee_pose, target, pos_error_threshold=0.015, ori_error_threshold=0.3, max_len=150)
             if result == "TIMEOUT":
@@ -409,10 +457,11 @@ class Leg(Part):
             target_ori = floor_grasp_ori(leg_pose_down)
             leg_pos_robot = (april_to_robot @ leg_pose_down[:4, 3])[:3]
             target_pos = leg_pos_robot.clone()
-            target_pos[1] += 0.01
-            target_pos[0] += self.grasp_margin_x
+            # target_pos[1] += 0.01
+            target_pos[0] += 0.005
             target_pos[2] = (april_to_robot @ leg_pose)[2, 3]
             clean_target = C.to_homogeneous(target_pos, target_ori)
+            clean_target = self._apply_latent_offset(state, clean_target)
             target = self._add_noise(clean_target, pos_std=0.003, ori_std_deg=3.0)
             self.gripper_action = 1
             result = self.gripper_less(gripper_width, 2 * self.half_width + 0.001)
@@ -425,14 +474,16 @@ class Leg(Part):
             target_pos[2] += 0.10
             target_ori = ee_pose[:3, :3]
             clean_target = C.to_homogeneous(target_pos, target_ori)
+            clean_target = self._apply_latent_offset(state, clean_target)
             target = self._add_noise(clean_target)
             result = self.satisfy(ee_pose, target, pos_error_threshold=0.02, ori_error_threshold=0.3, max_len=150)
             if result == "TIMEOUT":
                 timeout_failure = True
         elif state == "match_leg_ori":
-            target_ori = (margin @ rot_mat_tensor(np.pi, 0, 0, device))[:3, :3]
+            target_ori = (margin @ C.rot_mat_tensor(np.pi, 0, 0, device))[:3, :3]
             target_pos = torch.tensor([0.57, 0.1, 0.12], device=device)
             clean_target = C.to_homogeneous(target_pos, target_ori)
+            clean_target = self._apply_latent_offset(state, clean_target)
             target = self._add_noise(clean_target)
             result = self.satisfy(ee_pose, target, pos_error_threshold=0.02, ori_error_threshold=0.3, max_len=150)
             if result == "TIMEOUT":
@@ -449,9 +500,9 @@ class Leg(Part):
                 )
             )
             target_leg_pose_robot = torch.tensor(
-                [
-                    [1.0, 0.0, 0.0, table_hole_pose_robot[0, 3] + 0.005],
-                    [0.0, 0.0, -1.0, table_hole_pose_robot[1, 3] + 0.005],
+                [  # 0.004 and 0.003 are empirical offsets to make the leg align perfectly with the table hole
+                    [1.0, 0.0, 0.0, table_hole_pose_robot[0, 3] + 0.004],
+                    [0.0, 0.0, -1.0, table_hole_pose_robot[1, 3] + 0.003],
                     [0.0, 1.0, 0.0, table_pose[2, 3] + 0.14],
                     [0.0, 0.0, 0.0, 1.0],
                 ],
@@ -459,6 +510,7 @@ class Leg(Part):
             )
             rel = rel_rot_mat(leg_pose_robot, target_leg_pose_robot)
             clean_target = rel @ ee_pose
+            clean_target = self._apply_latent_offset(state, clean_target)
             target = self._add_noise(clean_target, pos_std=0.003, ori_std_deg=3.0)
             result = self.satisfy(ee_pose, target, pos_error_threshold=0.015, ori_error_threshold=0.3, max_len=150)
             if result == "TIMEOUT":
@@ -475,9 +527,9 @@ class Leg(Part):
                 )
             )
             target_leg_pose_robot = torch.tensor(
-                [
-                    [1.0, 0.0, 0.0, table_hole_pose_robot[0, 3] + 0.005],
-                    [0.0, 0.0, -1.0, table_hole_pose_robot[1, 3] + 0.005],
+                [  # 0.004 and 0.003 are empirical offsets to make the leg align perfectly with the table hole
+                    [1.0, 0.0, 0.0, table_hole_pose_robot[0, 3] + 0.004],
+                    [0.0, 0.0, -1.0, table_hole_pose_robot[1, 3] + 0.003],
                     [0.0, 1.0, 0.0, table_pose[2, 3] + 0.05],
                     [0.0, 0.0, 0.0, 1.0],
                 ],
@@ -485,34 +537,44 @@ class Leg(Part):
             )
             rel = rel_rot_mat(leg_pose_robot, target_leg_pose_robot)
             clean_target = rel @ ee_pose
+            clean_target = self._apply_latent_offset(state, clean_target)
             target = self._add_noise(clean_target, pos_std=0.001, ori_std_deg=1.0)
             result = self.satisfy(ee_pose, target, pos_error_threshold=0.007, ori_error_threshold=0.15, max_len=75)
             if result == "TIMEOUT":
                 timeout_failure = True
         elif state == "insert_release":
-            leg_pose_robot = april_to_robot @ leg_pose
-            leg_pose_robot = find_leg_pose_x_look_front(leg_pose_robot)
-            table_hole_pose_robot = (
-                april_to_robot
-                @ table_pose
-                @ torch.tensor(
-                    get_mat(self.default_assembled_pose[:3, 3], [0.0, 0.0, 0.0]),
+            self.gripper_action = -1
+            # Sub-phase gate: hold EE in place until the gripper has cleared the leg,
+            # then move upward to the pre-screw position.
+            gripper_cleared_leg = gripper_width >= 2 * self.half_width + 0.010
+            if gripper_cleared_leg:
+                leg_pose_robot = april_to_robot @ leg_pose
+                leg_pose_robot = find_leg_pose_x_look_front(leg_pose_robot)
+                table_hole_pose_robot = (
+                    april_to_robot
+                    @ table_pose
+                    @ torch.tensor(
+                        get_mat(self.default_assembled_pose[:3, 3], [0.0, 0.0, 0.0]),
+                        device=device,
+                    )
+                )
+                target_leg_pose_robot = torch.tensor(
+                    [  # 0.004 and 0.003 are empirical offsets to make the leg align perfectly with the table hole
+                        [1.0, 0.0, 0.0, table_hole_pose_robot[0, 3] + 0.004],
+                        [0.0, 0.0, -1.0, table_hole_pose_robot[1, 3] + 0.003],
+                        [0.0, 1.0, 0.0, table_pose[2, 3] + 0.084],
+                        [0.0, 0.0, 0.0, 1.0],
+                    ],
                     device=device,
                 )
-            )
-            target_leg_pose_robot = torch.tensor(
-                [
-                    [1.0, 0.0, 0.0, table_hole_pose_robot[0, 3] + 0.005],
-                    [0.0, 0.0, -1.0, table_hole_pose_robot[1, 3] + 0.005],
-                    [0.0, 1.0, 0.0, table_pose[2, 3] + 0.084],
-                    [0.0, 0.0, 0.0, 1.0],
-                ],
-                device=device,
-            )
-            rel = rel_rot_mat(leg_pose_robot, target_leg_pose_robot)
-            clean_target = rel @ ee_pose
-            target = self._add_noise(clean_target, pos_std=0.001, ori_std_deg=1.0)
-            self.gripper_action = -1
+                rel = rel_rot_mat(leg_pose_robot, target_leg_pose_robot)
+                clean_target = rel @ ee_pose
+                clean_target = self._apply_latent_offset(state, clean_target)
+                target = self._add_noise(clean_target, pos_std=0.001, ori_std_deg=1.0)
+            else:
+                # Gripper still closing around the leg — hold EE position, keep opening.
+                clean_target = ee_pose.clone()
+                target = clean_target
             result = self.gripper_greater(
                 gripper_width,
                 config["robot"]["max_gripper_width"]["square_table"] - 0.001,
@@ -520,10 +582,11 @@ class Leg(Part):
             if result == "TIMEOUT":
                 timeout_failure = True
         elif state == "release":
-            target_ori = rot_mat_tensor(np.pi, 0, 0, device)[:3, :3]
+            target_ori = C.rot_mat_tensor(np.pi, 0, 0, device)[:3, :3]
             target_pos = (april_to_robot @ leg_pose[:4, 3])[:3]
             target_pos[2] += self.grasp_margin_z
             clean_target = C.to_homogeneous(target_pos, target_ori)
+            clean_target = self._apply_latent_offset(state, clean_target)
             target = self._add_noise(clean_target, pos_std=0.001, ori_std_deg=1.0)
             self.gripper_action = -1
             result = self.gripper_greater(
@@ -533,20 +596,8 @@ class Leg(Part):
             if result == "TIMEOUT":
                 timeout_failure = True
         elif state == "pre_screw":
-            # Two-phase sequence within a single state (no inter-state threshold to chatter on):
-            #   Phase 1 — right the gripper: target Rx(π) (pre_grasp_ori, straight down).
-            #   Phase 2 — (after righting) rotate for screw grasp: target Rx(π)@Rz(π) (pre_screw_ori).
-            table_hole_pose_robot = (
-                april_to_robot
-                @ table_pose
-                @ torch.tensor(
-                    get_mat(self.default_assembled_pose[:3, 3], [0.0, 0.0, 0.0]),
-                    device=device,
-                ).float()
-            )
-            table_pose_robot = april_to_robot @ table_pose
-            target_pos = table_hole_pose_robot[:3, 3].clone()
-            target_pos[2] = table_pose_robot[2, 3] + 0.065
+            target_pos = (april_to_robot @ leg_pose)[:3, 3].clone()
+            target_pos[2] = 0.055
 
             ee_z_dot_down = -ee_pose[2, 2]  # 1.0 = EE Z-axis straight down
             ee_x_dot_world_x = ee_pose[0, 0]  # X-component of EE local-X (world frame)
@@ -555,52 +606,46 @@ class Leg(Part):
             # world-Z to pre_screw_ori.
             if ee_z_dot_down < 0.99:
                 # Phase 1: right the gripper (same for both modes).
-                target_ori = rot_mat_tensor(np.pi, 0, 0, device)[:3, :3]
+                target_ori = C.rot_mat_tensor(np.pi, 0, 0, device)[:3, :3]
             elif self.screw_mode == "alternate":
                 ee_x_dot_world_y = ee_pose[1, 0]
                 if ee_x_dot_world_y < 0.2:
                     # Phase 2a: rotate to Rz(30°) first.
                     print("phase 2a")
-                    target_ori = rot_mat_tensor(np.pi, 0, np.pi / 4, device)[:3, :3]
+                    target_ori = C.rot_mat_tensor(np.pi, 0, np.pi / 4, device)[:3, :3]
                 else:
                     # Phase 2b: final 90° CCW to Rx(π)@Rz(π/2).
                     print("phase 2b")
-                    target_ori = rot_mat_tensor(np.pi, 0, np.pi / 2, device)[:3, :3]
+                    target_ori = C.rot_mat_tensor(np.pi, 0, np.pi / 2, device)[:3, :3]
             else:  # standard
                 # Standard mode: 180° rotation split into two 90° phases to avoid ambiguity.
                 if ee_x_dot_world_x > 0.25:
                     # Phase 2a: first 90° CCW about world-Z.
                     print("phase 2a")
-                    target_ori = rot_mat_tensor(np.pi, 0, np.pi / 2, device)[:3, :3]
+                    target_ori = C.rot_mat_tensor(np.pi, 0, np.pi / 2, device)[:3, :3]
                 else:
                     # Phase 2b: final 90° to full pre_screw_ori.
                     print("phase 2b")
-                    target_ori = rot_mat_tensor(np.pi, 0, np.pi, device)[:3, :3]
+                    target_ori = C.rot_mat_tensor(np.pi, 0, np.pi, device)[:3, :3]
 
             clean_target = C.to_homogeneous(target_pos, target_ori)
-            target = self._add_noise(clean_target, pos_std=0.003, ori_std_deg=3.0)
+            clean_target = self._apply_latent_offset(state, clean_target)
+            target = self._add_noise(clean_target, pos_std=0.0, ori_std_deg=0.0)
             result = self.satisfy(ee_pose, target, max_len=300)
             if result == "TIMEOUT":
                 timeout_failure = True
         elif state == "screw_grasp":
-            # Close gripper at pre-screw position (same stable target as pre_screw).
-            table_hole_pose_robot = (
-                april_to_robot
-                @ table_pose
-                @ torch.tensor(
-                    get_mat(self.default_assembled_pose[:3, 3], [0.0, 0.0, 0.0]),
-                    device=device,
-                ).float()
-            )
-            table_pose_robot = april_to_robot @ table_pose
-            target_pos = table_hole_pose_robot[:3, 3].clone()
-            target_pos[2] = table_pose_robot[2, 3] + 0.065
+            # IMPORTANT: define target relative to leg pose so that we grab it centered
+            target_pos = (april_to_robot @ leg_pose)[:3, 3].clone()
+            # target_pos[2] = table_pose_robot[2, 3] + 0.065
+            target_pos[2] = 0.055
             if self.screw_mode == "alternate":
-                target_ori = rot_mat_tensor(np.pi, 0, np.pi / 2, device)[:3, :3]
+                target_ori = C.rot_mat_tensor(np.pi, 0, np.pi / 2, device)[:3, :3]
             else:  # standard
-                target_ori = rot_mat_tensor(np.pi, 0, np.pi, device)[:3, :3]
+                target_ori = C.rot_mat_tensor(np.pi, 0, np.pi, device)[:3, :3]
             clean_target = C.to_homogeneous(target_pos, target_ori)
-            target = self._add_noise(clean_target, pos_std=0.0005, ori_std_deg=1.0)
+            clean_target = self._apply_latent_offset(state, clean_target)
+            target = self._add_noise(clean_target, pos_std=0.0, ori_std_deg=0.0)
             self.gripper_action = 1
             result = self.gripper_less(gripper_width, 2 * self.half_width + 0.001)
             if result == "TIMEOUT":
@@ -608,33 +653,75 @@ class Leg(Part):
         elif state == "screw":
             # Rotate EE -180° about global Z from pre_screw back to Rx(π).
             # Split into two 90° steps (same technique as pre_screw) to avoid rotational ambiguity.
-            # At pre_screw_ori (Rz(π)@Rx(π)): ee_x_dot_world_x = -1.
-            # At intermediate    (Rz(π/2)@Rx(π)): ee_x_dot_world_x =  0.
-            # At final target    (Rx(π)):          ee_x_dot_world_x = +1.
             ee_x_dot_world_x = ee_pose[0, 0]
-            target_pos = ee_pos[:3].clone()
-            target_pos[2] -= 0.005
+            # # Anchor XY to the table hole (stable external reference) to provide a restoring
+            # # force against any XY perturbations (e.g. table_top sliding during screwing).
+            # table_hole_pose_robot = (
+            #     april_to_robot
+            #     @ table_pose
+            #     @ torch.tensor(
+            #         get_mat(self.default_assembled_pose[:3, 3], [0.0, 0.0, 0.0]),
+            #         device=device,
+            #     ).float()
+            # )
+            # target_pos = table_hole_pose_robot[:3, 3].clone()
+            # target_pos[2] = ee_pos[2] - 0.005  # keep downward pressure while screwing
+
+            # Simply hard-code target position during screwing
+            # Note: intentionally make the target height during screwing 1mm above the height during screw_grasp
+            # This way, the gripper doesn't apply too much force into the table_top
+            # ACTUALLY: the downward pressure works well too, but it makes the dynamics a little more predictable.
+            TARGET_EE_POS = [0.6453, 0.1375]
+            target_pos = torch.tensor(
+                [TARGET_EE_POS[0], TARGET_EE_POS[1], 0.056],
+                # [TARGET_EE_POS[0], TARGET_EE_POS[1], ee_pos[2].item() - 0.005],
+                device=ee_pos.device,
+                dtype=ee_pos.dtype,
+            )
+            # target_pos = ee_pos[:3].clone()
+            # target_pos[2] = 0.055
+            # target_pos[2] += 0.001
+            # target_pos[2] = ee_pos[2] - 0.004  # keep downward pressure while screwing
+            print(f"target_pos: {target_pos}")
+
+            # print("abs(ee_pos[0] - TARGET_EE_POS[0]):", abs(ee_pos[0] - TARGET_EE_POS[0]))
+            # print("abs(ee_pos[1] - TARGET_EE_POS[1]):", abs(ee_pos[1] - TARGET_EE_POS[1]))
+
+            # if abs(ee_pos[0] - TARGET_EE_POS[0]) > 0.0025 or abs(ee_pos[1] - TARGET_EE_POS[1]) > 0.0025:
+            #     current_yaw = torch.atan2(ee_pose[1, 0], ee_pose[0, 0])
+            #     target_ori = C.rot_mat_tensor(np.pi, 0, current_yaw.item(), device)[:3, :3]
+            # else:
             if self.screw_mode == "alternate":
                 ee_x_dot_world_y = ee_pose[1, 0]
                 if ee_x_dot_world_y > 0.75:
                     # Phase a: first 90° CW (Rz: π/2 → 0).
                     print("phase 2a")
-                    target_ori = rot_mat_tensor(np.pi, 0, 0, device)[:3, :3]
+                    target_ori = C.rot_mat_tensor(np.pi, 0, 0, device)[:3, :3]
                 else:
                     # Phase b: second 90° CW (Rz: 0 → −π/2).
                     print("phase 2b")
-                    target_ori = rot_mat_tensor(np.pi, 0, -np.pi / 2, device)[:3, :3]
+                    target_ori = C.rot_mat_tensor(np.pi, 0, -np.pi / 2 - 0.1, device)[:3, :3]
             else:  # standard
+                # At pre_screw_ori (Rz(π)@Rx(π)): ee_x_dot_world_x = -1.
+                # At intermediate    (Rz(π/2)@Rx(π)): ee_x_dot_world_x =  0.
+                # At final target    (Rx(π)):          ee_x_dot_world_x = +1.
                 if ee_x_dot_world_x < -0.25:
                     # Phase 2a: first 90° CW (Rz: π → π/2).
                     print("phase 2a")
-                    target_ori = rot_mat_tensor(np.pi, 0, np.pi / 2, device)[:3, :3]
+                    target_ori = C.rot_mat_tensor(np.pi, 0, np.pi / 2, device)[:3, :3]
                 else:
                     # Phase 2b: final 90° CW (Rz: π/2 → 0) to screw target.
                     print("phase 2b")
-                    target_ori = rot_mat_tensor(np.pi, 0, 0, device)[:3, :3]
+                    target_ori = C.rot_mat_tensor(np.pi, 0, 0 - 0.1, device)[:3, :3]
+
+            # Intentially tilt a little bit into the corner of the obstacle to avoid the table_top sliding
+            TILT_ANGLE = 3
+            tilt = C.rot_mat_tensor(np.radians(TILT_ANGLE), np.radians(-TILT_ANGLE), 0, device)[:3, :3]
+            target_ori = tilt @ target_ori
+
             clean_target = C.to_homogeneous(target_pos, target_ori)
-            target = self._add_noise(clean_target, pos_std=0.0005, ori_std_deg=1.0)
+            clean_target = self._apply_latent_offset(state, clean_target)
+            target = self._add_noise(clean_target, pos_std=0.0, ori_std_deg=0.0)
             result = self.satisfy(ee_pose, target, ori_error_threshold=0.3, max_len=75)
             if result == "TIMEOUT":
                 timeout_failure = True
