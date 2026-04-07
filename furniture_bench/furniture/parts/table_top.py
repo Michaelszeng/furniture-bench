@@ -17,6 +17,8 @@ class TableTop(Part):
 
         self.gripper_action = -1
         self.body_grip_width = 0.01
+        # Fractional offset along the grasped side: 0.0 = center, 0.5 = 3/4 from one end.
+        self.grasp_side_offset_frac = -0.25
 
         self.skill_complete_next_states = [
             "push",
@@ -28,6 +30,7 @@ class TableTop(Part):
         super().reset()  # resets prev_cnt=0, curr_cnt=0, pre_assemble_done, etc.
         self._last_state = "reach_body_grasp_xy"
         self.gripper_action = -1
+        self._grasp_side_offset_robot = None  # set once grasp target is first computed
 
     def is_in_reset_ori(self, pose, from_skill, ori_bound):
         reset_ori = self.reset_ori[from_skill] if len(self.reset_ori) > 1 else self.reset_ori[0]
@@ -63,9 +66,19 @@ class TableTop(Part):
         target_pos = (april_to_robot @ pos)[:3]
         target_ori = (april_to_robot @ rot)[:3, :3]
         target_pos[2] = ee_pos[2]  # keep current Z
+        # Shift grasp from the center of the side to 3/4 along it.
+        # body_pose local x-axis runs along the face; half_width/2 = 1/4 of the full
+        # side length, moving the grasp point from 1/2 to 3/4 from one end.
+        side_dir_april = body_pose[:3, 0]
+        side_dir_robot = april_to_robot[:3, :3] @ side_dir_april
+        grasp_offset = side_dir_robot * (self.half_width * self.grasp_side_offset_frac)
+        self._grasp_side_offset_robot = grasp_offset
+        target_pos = target_pos + grasp_offset
         return C.to_homogeneous(target_pos, target_ori)
 
-    def _get_push_target(self, rb_states, part_idxs, sim_to_april_mat, april_to_robot, ee_pose, device):
+    def _get_push_target(
+        self, rb_states, part_idxs, sim_to_april_mat, april_to_robot, ee_pose, device, body_pose_robot
+    ):
         """Compute the push target position from obstacle poses."""
         target_pos = torch.zeros((4,), device=device)
         target_pos[-1] = 1
@@ -80,9 +93,12 @@ class TableTop(Part):
             target_pos[1] = max(obstacle_pos[1], target_pos[1])
         target_pos = april_to_robot @ sim_to_april_mat @ target_pos
         target_pos[0] -= self.half_width * 2
+        target_pos[0] -= 0.005  # Empirical offset to avoid early collision with the obstacle
         target_pos[1] -= self.half_width
-        target_pos[2] = ee_pose[2, 3]  # keep current Z
+        target_pos[2] = body_pose_robot[2, 3]
         target_pos = target_pos[:3]
+        if self._grasp_side_offset_robot is not None:
+            target_pos = target_pos + self._grasp_side_offset_robot
         target_ori = torch.zeros((3, 3), device=device)
         target_ori[0][1] = 1
         target_ori[1][0] = 1
@@ -105,12 +121,14 @@ class TableTop(Part):
         body_pose_robot, body_pose_april = self._get_body_pose_robot(
             rb_states, part_idxs, sim_to_april_mat, april_to_robot
         )
-        push_target = self._get_push_target(rb_states, part_idxs, sim_to_april_mat, april_to_robot, ee_pose, device)
+        push_target = self._get_push_target(
+            rb_states, part_idxs, sim_to_april_mat, april_to_robot, ee_pose, device, body_pose_robot
+        )
 
         gripper_open_thr = config["robot"]["max_gripper_width"]["square_table"] - 0.005
 
         push_xy = push_target[:2, 3]
-        at_push_xy = (ee_pos[:2] - push_xy).abs().sum() < self.pos_error_threshold * 2.5
+        at_push_xy = (ee_pos[:2] - push_xy).abs().sum() < self.pos_error_threshold * 3
 
         # Whether the table body has been physically pushed near the push target.
         # This prevents "done"/"go_up" from firing at episode start when the EE happens
@@ -178,6 +196,7 @@ class TableTop(Part):
         body_pose_robot, body_pose_april = self._get_body_pose_robot(
             rb_states, part_idxs, sim_to_april_mat, april_to_robot
         )
+        body_pose_robot[2, 3] += 0.01  # Make robot grasp table_top slightly higher
         device = ee_pose.device
 
         # Default target: stay at current EE pose
@@ -220,7 +239,7 @@ class TableTop(Part):
 
         elif state == "push":
             clean_target = self._get_push_target(
-                rb_states, part_idxs, sim_to_april_mat, april_to_robot, ee_pose, device
+                rb_states, part_idxs, sim_to_april_mat, april_to_robot, ee_pose, device, body_pose_robot
             )
             target = self._add_noise(clean_target, pos_std=0.001)
             result = self.satisfy(ee_pose, target, pos_error_threshold=0.02, ori_error_threshold=0.5, max_len=300)
@@ -229,7 +248,7 @@ class TableTop(Part):
 
         elif state == "release":
             clean_target = self._get_push_target(
-                rb_states, part_idxs, sim_to_april_mat, april_to_robot, ee_pose, device
+                rb_states, part_idxs, sim_to_april_mat, april_to_robot, ee_pose, device, body_pose_robot
             )
             target = self._add_noise(clean_target, pos_std=0.003, ori_std_deg=3.0)
             self.gripper_action = -1
@@ -241,7 +260,9 @@ class TableTop(Part):
                 timeout_failure = True
 
         elif state == "go_up":
-            push_target = self._get_push_target(rb_states, part_idxs, sim_to_april_mat, april_to_robot, ee_pose, device)
+            push_target = self._get_push_target(
+                rb_states, part_idxs, sim_to_april_mat, april_to_robot, ee_pose, device, body_pose_robot
+            )
             target_pos = push_target[:3, 3].clone()
             target_pos[2] = 0.1
             target_ori = push_target[:3, :3]
@@ -253,7 +274,9 @@ class TableTop(Part):
 
         elif state == "done":
             self.pre_assemble_done = True
-            push_target = self._get_push_target(rb_states, part_idxs, sim_to_april_mat, april_to_robot, ee_pose, device)
+            push_target = self._get_push_target(
+                rb_states, part_idxs, sim_to_april_mat, april_to_robot, ee_pose, device, body_pose_robot
+            )
             target_pos = push_target[:3, 3].clone()
             target_pos[2] = 0.1
             target_ori = push_target[:3, :3]

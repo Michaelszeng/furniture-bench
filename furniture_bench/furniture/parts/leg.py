@@ -1,3 +1,5 @@
+import random
+
 import numpy as np
 import numpy.typing as npt
 import torch
@@ -39,17 +41,16 @@ class Leg(Part):
         self.gripper_action = -1
         self.screw_mode = "standard"  # latent variable: "standard" or "alternate" (-90° Z offset)
         self.latent_offsets = {}  # per-state 3D position offsets, empty = no latent plan
+        self.pause_durations = {}  # per-state pause steps sampled at episode start
+        self._pause_remaining = 0  # steps left in the current pause
 
     def apply_non_markovian_config(self):
         """Sample episode-level non-Markovian latent variables."""
-        import random
-
-        import numpy as np
-
         self.screw_mode = random.choice(["standard", "alternate"])
 
         # States that require positional precision get small offsets; all others get large offsets.
-        PRECISION_STATES = {"reach_leg_floor_z", "reach_table_top_z", "screw_grasp", "screw"}
+        LOW_STD_STATES = {"reach_table_top_z", "pre_screw"}
+        ZERO_STD_STATES = {"screw_grasp", "screw", "insert_release", "reach_leg_floor_z"}
         HIGH_STD = 0.020  # m — persistent offset for coarse-motion states
         LOW_STD = 0.003  # m — persistent offset for precision states
 
@@ -69,9 +70,15 @@ class Leg(Part):
             "screw",
         ]
         self.latent_offsets = {
-            state: np.random.normal(0, LOW_STD if state in PRECISION_STATES else HIGH_STD, size=(3,))
+            state: np.random.normal(
+                0, 0 if state in ZERO_STD_STATES else LOW_STD if state in LOW_STD_STATES else HIGH_STD, size=(3,)
+            )
             for state in all_states
         }
+
+        # Sample a pause duration (in steps) for each state: Uniform[0, 1 second] @ 10 Hz.
+        pause_max = config["robot"]["hz"]  # = 10 steps per second
+        self.pause_durations = {state: np.random.randint(0, pause_max + 1) for state in all_states}
 
     def _apply_latent_offset(self, state: str, clean_target):
         """
@@ -365,6 +372,38 @@ class Leg(Part):
         timeout_failure = False
 
         ee_pose = C.to_homogeneous(ee_pos, C.quat2mat(ee_quat))
+
+        # ── Non-Markovian pause injection ─────────────────────────────────────────
+        if self.pause_durations:
+            # On the first step of each new state, arm the pause counter once.
+            if state != self._last_state and self._pause_remaining == 0:
+                self._pause_remaining = self.pause_durations.get(state, 0)
+
+            if self._pause_remaining > 0:
+                # Hold current EE pose (with per-step noise) for the duration of the pause.
+                # Do NOT call state_transition_handler so curr_cnt stays frozen, preserving
+                # the full timeout budget for the actual action phase that follows.
+                device = ee_pose.device
+                clean_target = ee_pose.clone()
+                target = self._add_noise(clean_target)
+                # skill_complete fires only on the very first step of the new state.
+                skill_complete = 1 if (state != self._last_state and state in self.skill_complete_next_states) else 0
+                self._last_state = state  # mark state seen without advancing curr_cnt
+                self._pause_remaining -= 1
+                if self._pause_remaining == 0:
+                    # Pause just expired: reset timeout budget so action phase runs in full.
+                    self.prev_cnt = self.curr_cnt
+                return (
+                    target[:3, 3],
+                    C.mat2quat(target[:3, :3]),
+                    clean_target[:3, 3],
+                    C.mat2quat(clean_target[:3, :3]),
+                    torch.tensor([self.gripper_action], device=device),
+                    skill_complete,
+                    False,
+                )
+        # ── end pause injection ────────────────────────────────────────────────────
+
         table_pose = C.to_homogeneous(
             rb_states[part_idxs[assemble_to]][0][:3],
             C.quat2mat(rb_states[part_idxs[assemble_to]][0][3:7]),
@@ -500,9 +539,9 @@ class Leg(Part):
                 )
             )
             target_leg_pose_robot = torch.tensor(
-                [  # 0.004 and 0.003 are empirical offsets to make the leg align perfectly with the table hole
-                    [1.0, 0.0, 0.0, table_hole_pose_robot[0, 3] + 0.004],
-                    [0.0, 0.0, -1.0, table_hole_pose_robot[1, 3] + 0.003],
+                [  # 0.003 and 0.002 are empirical offsets to make the leg align perfectly with the table hole
+                    [1.0, 0.0, 0.0, table_hole_pose_robot[0, 3] + 0.003],
+                    [0.0, 0.0, -1.0, table_hole_pose_robot[1, 3] + 0.002],
                     [0.0, 1.0, 0.0, table_pose[2, 3] + 0.14],
                     [0.0, 0.0, 0.0, 1.0],
                 ],
@@ -527,9 +566,9 @@ class Leg(Part):
                 )
             )
             target_leg_pose_robot = torch.tensor(
-                [  # 0.004 and 0.003 are empirical offsets to make the leg align perfectly with the table hole
-                    [1.0, 0.0, 0.0, table_hole_pose_robot[0, 3] + 0.004],
-                    [0.0, 0.0, -1.0, table_hole_pose_robot[1, 3] + 0.003],
+                [  # 0.003 and 0.002 are empirical offsets to make the leg align perfectly with the table hole
+                    [1.0, 0.0, 0.0, table_hole_pose_robot[0, 3] + 0.003],
+                    [0.0, 0.0, -1.0, table_hole_pose_robot[1, 3] + 0.012],
                     [0.0, 1.0, 0.0, table_pose[2, 3] + 0.05],
                     [0.0, 0.0, 0.0, 1.0],
                 ],
@@ -559,9 +598,9 @@ class Leg(Part):
                     )
                 )
                 target_leg_pose_robot = torch.tensor(
-                    [  # 0.004 and 0.003 are empirical offsets to make the leg align perfectly with the table hole
-                        [1.0, 0.0, 0.0, table_hole_pose_robot[0, 3] + 0.004],
-                        [0.0, 0.0, -1.0, table_hole_pose_robot[1, 3] + 0.003],
+                    [  # 0.003 and 0.002 are empirical offsets to make the leg align perfectly with the table hole
+                        [1.0, 0.0, 0.0, table_hole_pose_robot[0, 3] + 0.003],
+                        [0.0, 0.0, -1.0, table_hole_pose_robot[1, 3] + 0.012],
                         [0.0, 1.0, 0.0, table_pose[2, 3] + 0.084],
                         [0.0, 0.0, 0.0, 1.0],
                     ],
@@ -670,11 +709,12 @@ class Leg(Part):
             # Simply hard-code target position during screwing
             # Note: intentionally make the target height during screwing 1mm above the height during screw_grasp
             # This way, the gripper doesn't apply too much force into the table_top
-            # ACTUALLY: the downward pressure works well too, but it makes the dynamics a little more predictable.
+            # ACTUALLY: the downward pressure seems more stable, but it makes the dynamics a little more predictable.
+            # So doesn't require as much reactivity.
             TARGET_EE_POS = [0.6453, 0.1375]
             target_pos = torch.tensor(
                 [TARGET_EE_POS[0], TARGET_EE_POS[1], 0.056],
-                # [TARGET_EE_POS[0], TARGET_EE_POS[1], ee_pos[2].item() - 0.005],
+                # [TARGET_EE_POS[0], TARGET_EE_POS[1], ee_pos[2].item() - 0.003],
                 device=ee_pos.device,
                 dtype=ee_pos.dtype,
             )

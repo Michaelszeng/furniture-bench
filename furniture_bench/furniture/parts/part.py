@@ -45,6 +45,7 @@ class Part(ABC):
         self.curr_cnt = 0
         self.part_moved_skill_idx = part_config.get("part_moved_skill_idx", np.inf)
         self.part_attached_skill_idx = part_config.get("part_attached_skill_idx", np.inf)
+        self.no_noise = False
 
     def randomize_init_pose(self, from_skill=0, pos_range=[-0.05, 0.05], rot_range=45):
         self.reset_pos[from_skill][:2] = self.part_config["reset_pos"][from_skill][:2] + np.random.uniform(
@@ -239,7 +240,7 @@ class Part(ABC):
 
     def _add_noise(self, target, pos_std=0.004, ori_std_deg=4.0):
         """Apply per-step Gaussian noise to a homogeneous target matrix."""
-        if self.state_no_noise():
+        if self.no_noise or self.state_no_noise():
             return target
         noisy = target.clone()
         noisy[:3, 3] += torch.normal(mean=torch.zeros(3), std=torch.tensor(pos_std, dtype=torch.float32)).to(
@@ -292,7 +293,7 @@ class Part(ABC):
 
     def add_noise_first_target(self, target, pos_noise=None, ori_noise=None):
         """Legacy per-state-entry noise. Kept for cabinet/lamp/round_table parts."""
-        if self.state_no_noise():
+        if self.no_noise or self.state_no_noise():
             return target
         if self.first_setting_target:
             if pos_noise is not None:

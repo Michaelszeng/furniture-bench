@@ -47,6 +47,7 @@ if _max_contact_pairs := int(os.environ.get("PHYSX_MAX_GPU_CONTACT_PAIRS", 0)):
 sim_config["sim_params"] = sim_params
 sim_config["parts"] = {"friction": 0.15}
 sim_config["table"] = {"friction": 0.10}
+sim_config["obstacle"] = {"friction": 0.15}
 sim_config["asset"] = {}
 
 # Parameters for the robot.

@@ -75,6 +75,7 @@ class FurnitureSimEnv(gym.Env):
         action_type: str = "delta",  # "delta" or "pos"
         ctrl_mode: str = "osc",
         ee_laser: bool = False,
+        no_noise: bool = False,
         **kwargs,
     ):
         """
@@ -153,6 +154,14 @@ class FurnitureSimEnv(gym.Env):
         # our flags
         self.ctrl_mode = ctrl_mode
         self.ee_laser = ee_laser
+        self.no_noise = no_noise
+        if no_noise:
+            for furn in self.furnitures:
+                for part in furn.parts:
+                    part.no_noise = True
+            if self.furniture not in self.furnitures:
+                for part in self.furniture.parts:
+                    part.no_noise = True
 
         self._create_ground_plane()
         self._setup_lights()
@@ -291,6 +300,10 @@ class FurnitureSimEnv(gym.Env):
                 self.part_idxs["obstacle_front"] = [part_idx]
             else:
                 self.part_idxs["obstacle_front"].append(part_idx)
+            # Set obstacle friction.
+            obstacle_props = self.isaac_gym.get_actor_rigid_shape_properties(env, obstacle_handle)
+            obstacle_props[0].friction = sim_config["obstacle"]["friction"]
+            self.isaac_gym.set_actor_rigid_shape_properties(env, obstacle_handle, obstacle_props)
 
             for j, name in enumerate(["obstacle_right", "obstacle_left"]):
                 y = -0.175 if j == 0 else 0.175
@@ -308,6 +321,11 @@ class FurnitureSimEnv(gym.Env):
                     self.part_idxs[name] = [part_idx]
                 else:
                     self.part_idxs[name].append(part_idx)
+                # Set obstacle friction.
+                obstacle_props = self.isaac_gym.get_actor_rigid_shape_properties(env, obstacle_handle)
+                obstacle_props[0].friction = sim_config["obstacle"]["friction"]
+                self.isaac_gym.set_actor_rigid_shape_properties(env, obstacle_handle, obstacle_props)
+
             # Add robot.
             franka_handle = self.isaac_gym.create_actor(env, self.franka_asset, self.franka_pose, "franka", i, 0)
             self.franka_num_dofs = self.isaac_gym.get_actor_dof_count(env, franka_handle)
@@ -1537,7 +1555,8 @@ class FurnitureSimEnv(gym.Env):
         delta_pos = delta_pos * delta_pos_sign
         max_delta_pos = 0.11 + 0.01 * torch.rand(3, device=self.device)
         max_delta_pos[2] -= 0.04
-        delta_pos = torch.clamp(delta_pos, min=-max_delta_pos, max=max_delta_pos)
+        scale = (delta_pos.abs() / max_delta_pos).max().clamp(min=1.0)
+        delta_pos = delta_pos / scale
         delta_quat = C.quat_mul(C.quat_conjugate(ee_quat), goal_ori)
         identity_quat = torch.tensor([0.0, 0.0, 0.0, 1.0], device=self.device)
         delta_quat = C.quat_slerp(identity_quat, delta_quat, self.delta_quat_gain)
@@ -1551,14 +1570,15 @@ class FurnitureSimEnv(gym.Env):
                 clean_delta_pos[i] = 0.03 + (clean_delta_pos[i] - 0.03) * 1.5  # deterministic scale
         clean_delta_pos = clean_delta_pos * clean_delta_pos_sign
         clean_max_delta_pos = torch.tensor([0.11, 0.11, 0.07], device=self.device)
-        clean_delta_pos = torch.clamp(clean_delta_pos, min=-clean_max_delta_pos, max=clean_max_delta_pos)
+        clean_scale = (clean_delta_pos.abs() / clean_max_delta_pos).max().clamp(min=1.0)
+        clean_delta_pos = clean_delta_pos / clean_scale
         clean_delta_quat = C.quat_mul(C.quat_conjugate(ee_quat), clean_goal_ori)
         clean_delta_quat = C.quat_slerp(identity_quat, clean_delta_quat, self.delta_quat_gain)
 
         clean_action = torch.concat([clean_delta_pos, clean_delta_quat, gripper])
 
         # Randomly choose to add random noise to the action
-        if self.furniture.parts[part_idx2].state_no_noise():
+        if not self.no_noise and self.furniture.parts[part_idx2].state_no_noise():
             delta_pos = torch.normal(delta_pos, 0.005)
             delta_quat = C.quat_multiply(
                 delta_quat,
