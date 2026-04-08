@@ -301,9 +301,10 @@ class FurnitureSimEnv(gym.Env):
             else:
                 self.part_idxs["obstacle_front"].append(part_idx)
             # Set obstacle friction.
-            obstacle_props = self.isaac_gym.get_actor_rigid_shape_properties(env, obstacle_handle)
-            obstacle_props[0].friction = sim_config["obstacle"]["friction"]
-            self.isaac_gym.set_actor_rigid_shape_properties(env, obstacle_handle, obstacle_props)
+            if sim_config.get("obstacle") is not None:
+                obstacle_props = self.isaac_gym.get_actor_rigid_shape_properties(env, obstacle_handle)
+                obstacle_props[0].friction = sim_config["obstacle"]["friction"]
+                self.isaac_gym.set_actor_rigid_shape_properties(env, obstacle_handle, obstacle_props)
 
             for j, name in enumerate(["obstacle_right", "obstacle_left"]):
                 y = -0.175 if j == 0 else 0.175
@@ -322,9 +323,10 @@ class FurnitureSimEnv(gym.Env):
                 else:
                     self.part_idxs[name].append(part_idx)
                 # Set obstacle friction.
-                obstacle_props = self.isaac_gym.get_actor_rigid_shape_properties(env, obstacle_handle)
-                obstacle_props[0].friction = sim_config["obstacle"]["friction"]
-                self.isaac_gym.set_actor_rigid_shape_properties(env, obstacle_handle, obstacle_props)
+                if sim_config.get("obstacle") is not None:
+                    obstacle_props = self.isaac_gym.get_actor_rigid_shape_properties(env, obstacle_handle)
+                    obstacle_props[0].friction = sim_config["obstacle"]["friction"]
+                    self.isaac_gym.set_actor_rigid_shape_properties(env, obstacle_handle, obstacle_props)
 
             # Add robot.
             franka_handle = self.isaac_gym.create_actor(env, self.franka_asset, self.franka_pose, "franka", i, 0)
@@ -1420,6 +1422,41 @@ class FurnitureSimEnv(gym.Env):
                 return idx
         return len(self.furniture.should_be_assembled)  # all assembled
 
+    def _compute_delta_pos(
+        self,
+        goal_pos: torch.Tensor,
+        ee_pos: torch.Tensor,
+        max_delta_xy: float,
+        max_delta_z: float,
+        noisy: bool,
+    ) -> torch.Tensor:
+        """Compute a clamped delta-position action from a goal position.
+
+        Applies a gain, a nonlinear kick for large errors, then independently
+        clamps XY and Z to their respective speed limits.  When noisy=True the
+        kick multiplier and the XY limit are randomised; when noisy=False they
+        are deterministic.
+        """
+        delta = goal_pos - ee_pos
+        sign = delta.sign()
+        delta = delta.abs() * self.delta_pos_gain
+        for i in range(3):
+            if delta[i] > 0.03:
+                multiplier = float(np.random.normal(1.5, 0.1)) if noisy else 1.5
+                delta[i] = 0.03 + (delta[i] - 0.03) * multiplier
+        delta = delta * sign
+        if noisy:
+            xy_limit = max_delta_xy + 0.01 * torch.rand(1, device=self.device).item()
+            z_limit = max_delta_z + 0.01 * torch.rand(1, device=self.device).item()
+        else:
+            xy_limit = max_delta_xy
+            z_limit = max_delta_z
+        xy_scale = (delta[:2].abs() / xy_limit).max().clamp(min=1.0)
+        z_scale = (delta[2].abs() / z_limit).clamp(min=1.0)
+        delta[:2] = delta[:2] / xy_scale
+        delta[2] = delta[2] / z_scale
+        return delta
+
     def get_assembly_action(self) -> torch.Tensor:
         """
         Scripted furniture assembly logic (Markovian: all state inferred from env).
@@ -1542,57 +1579,57 @@ class FurnitureSimEnv(gym.Env):
             if part2._last_state == "screw":
                 self.delta_pos_gain = 4.0
                 self.delta_quat_gain = 1.0
+                MAX_DELTA_XY = 0.13
+                MAX_DELTA_Z = 0.07
+            elif part2._last_state == "reach_table_top_z":
+                self.delta_pos_gain = 2.5
+                self.delta_quat_gain = 1.0
+                MAX_DELTA_XY = 0.13
+                MAX_DELTA_Z = 0.015
             else:
                 self.delta_pos_gain = 2.5
                 self.delta_quat_gain = 1.0
+                MAX_DELTA_XY = 0.13
+                MAX_DELTA_Z = 0.07
 
         # Compute noisy delta position from (noisy) goal
-        delta_pos = goal_pos - ee_pos
-        delta_pos_sign = delta_pos.sign()
-        delta_pos = torch.abs(delta_pos) * self.delta_pos_gain
-        for i in range(3):
-            if delta_pos[i] > 0.03:
-                delta_pos[i] = 0.03 + (delta_pos[i] - 0.03) * np.random.normal(1.5, 0.1)
-        delta_pos = delta_pos * delta_pos_sign
-        max_delta_pos = 0.11 + 0.01 * torch.rand(3, device=self.device)
-        max_delta_pos[2] -= 0.04
-        scale = (delta_pos.abs() / max_delta_pos).max().clamp(min=1.0)
-        delta_pos = delta_pos / scale
-        delta_quat = C.quat_mul(C.quat_conjugate(ee_quat), goal_ori)
         identity_quat = torch.tensor([0.0, 0.0, 0.0, 1.0], device=self.device)
+        delta_pos = self._compute_delta_pos(
+            goal_pos, ee_pos, max_delta_xy=MAX_DELTA_XY, max_delta_z=MAX_DELTA_Z, noisy=True
+        )
+        delta_quat = C.quat_mul(C.quat_conjugate(ee_quat), goal_ori)
         delta_quat = C.quat_slerp(identity_quat, delta_quat, self.delta_quat_gain)
 
         # Compute clean delta position from clean goal (deterministic — no random kick or clamp noise)
-        clean_delta_pos = clean_goal_pos - ee_pos
-        clean_delta_pos_sign = clean_delta_pos.sign()
-        clean_delta_pos = torch.abs(clean_delta_pos) * self.delta_pos_gain
-        for i in range(3):
-            if clean_delta_pos[i] > 0.03:
-                clean_delta_pos[i] = 0.03 + (clean_delta_pos[i] - 0.03) * 1.5  # deterministic scale
-        clean_delta_pos = clean_delta_pos * clean_delta_pos_sign
-        clean_max_delta_pos = torch.tensor([0.11, 0.11, 0.07], device=self.device)
-        clean_scale = (clean_delta_pos.abs() / clean_max_delta_pos).max().clamp(min=1.0)
-        clean_delta_pos = clean_delta_pos / clean_scale
+        clean_delta_pos = self._compute_delta_pos(
+            clean_goal_pos, ee_pos, max_delta_xy=MAX_DELTA_XY, max_delta_z=MAX_DELTA_Z, noisy=False
+        )
         clean_delta_quat = C.quat_mul(C.quat_conjugate(ee_quat), clean_goal_ori)
         clean_delta_quat = C.quat_slerp(identity_quat, clean_delta_quat, self.delta_quat_gain)
 
         clean_action = torch.concat([clean_delta_pos, clean_delta_quat, gripper])
 
-        # Randomly choose to add random noise to the action
-        if not self.no_noise and self.furniture.parts[part_idx2].state_no_noise():
-            delta_pos = torch.normal(delta_pos, 0.005)
+        # Randomly add noise to the executed action (not recorded).
+        # Low-action-noise states get half the standard deviation and hard clips.
+        if not self.no_noise and not self.furniture.parts[part_idx2].state_no_noise():
+            low_noise = self.furniture.parts[part_idx2].state_low_action_noise()
+            action_noise_scale = 0.5 if low_noise else 1.0
+            pos_noise = torch.normal(torch.zeros_like(delta_pos), 0.005 * action_noise_scale)
+            if low_noise:
+                pos_clip = 0.005
+                pos_noise = pos_noise.clamp(-pos_clip, pos_clip)
+            delta_pos = delta_pos + pos_noise
+            aa_noise = [
+                np.radians(np.random.normal(0, 5 * action_noise_scale)),
+                np.radians(np.random.normal(0, 5 * action_noise_scale)),
+                np.radians(np.random.normal(0, 5 * action_noise_scale)),
+            ]
+            if low_noise:
+                aa_clip = np.radians(4.0)
+                aa_noise = [np.clip(v, -aa_clip, aa_clip) for v in aa_noise]
             delta_quat = C.quat_multiply(
                 delta_quat,
-                torch.tensor(
-                    T.axisangle2quat(
-                        [
-                            np.radians(np.random.normal(0, 5)),
-                            np.radians(np.random.normal(0, 5)),
-                            np.radians(np.random.normal(0, 5)),
-                        ]
-                    ),
-                    device=self.device,
-                ),
+                torch.tensor(T.axisangle2quat(aa_noise), device=self.device),
             ).to(self.device)
 
         noisy_action = torch.concat([delta_pos, delta_quat, gripper])

@@ -238,27 +238,43 @@ class Part(ABC):
         # Only fire skill_complete on the step we first enter a skill_complete state
         return 1 if (new_state != prev_state and new_state in self.skill_complete_next_states) else 0
 
-    def _add_noise(self, target, pos_std=0.004, ori_std_deg=4.0):
-        """Apply per-step Gaussian noise to a homogeneous target matrix."""
+    def _add_noise(
+        self,
+        target,
+        pos_std=0.004,
+        pos_std_z=None,
+        ori_std_deg=4.0,
+        pos_max=None,
+        ori_max_deg=None,
+    ):
+        """
+        Add noise to TARGET.
+
+        Args:
+            pos_max: if given, clamp each position noise component to [-pos_max, pos_max].
+            ori_max_deg: if given, clamp each axis-angle noise component to [-ori_max_deg, ori_max_deg].
+            pos_std_z: if given, use this std for the z position noise instead of pos_std.
+        """
         if self.no_noise or self.state_no_noise():
             return target
         noisy = target.clone()
-        noisy[:3, 3] += torch.normal(mean=torch.zeros(3), std=torch.tensor(pos_std, dtype=torch.float32)).to(
-            target.device
-        )
+        std = torch.tensor([pos_std, pos_std, pos_std_z if pos_std_z is not None else pos_std], dtype=torch.float32)
+        pos_noise = torch.normal(mean=torch.zeros(3), std=std)
+        if pos_max is not None:
+            pos_noise = pos_noise.clamp(-pos_max, pos_max)
+        noisy[:3, 3] += pos_noise.to(target.device)
+        ori_noise = [
+            np.radians(np.random.normal(0, ori_std_deg)),
+            np.radians(np.random.normal(0, ori_std_deg)),
+            np.radians(np.random.normal(0, ori_std_deg)),
+        ]
+        if ori_max_deg is not None:
+            ori_max_rad = np.radians(ori_max_deg)
+            ori_noise = [np.clip(v, -ori_max_rad, ori_max_rad) for v in ori_noise]
         ori = C.mat2quat(noisy[:3, :3]).to(target.device)
         ori = C.quat_multiply(
             ori,
-            torch.tensor(
-                T.axisangle2quat(
-                    [
-                        np.radians(np.random.normal(0, ori_std_deg)),
-                        np.radians(np.random.normal(0, ori_std_deg)),
-                        np.radians(np.random.normal(0, ori_std_deg)),
-                    ]
-                ),
-                device=target.device,
-            ),
+            torch.tensor(T.axisangle2quat(ori_noise), device=target.device),
         ).to(target.device)
         noisy[:3, :3] = C.quat2mat(ori)
         return noisy
@@ -274,6 +290,9 @@ class Part(ABC):
         self.target = None
 
     def state_no_noise(self):
+        return False
+
+    def state_low_action_noise(self):
         return False
 
     # ---- Backward-compat methods for non-one_leg parts (cabinet, lamp, round_table) ----

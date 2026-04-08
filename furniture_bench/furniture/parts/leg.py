@@ -13,6 +13,13 @@ from furniture_bench.utils.pose import get_mat, is_similar_rot, is_similar_xz, r
 
 
 class Leg(Part):
+    # Ry angle (radians) that pitches the EE toward the floor during the floor pick-up.
+    # Adjust here to change the grasp tilt; used identically in compute_state and fsm_step.
+    _GRASP_MARGIN_ANGLE: float = -np.pi / 9
+    _LEG_TIP_OFFSET: float = 0.05625  # distance from leg mesh origin to screw tip (m)
+    _LEG_HOLE_OFFSET_X: float = 0.004  # fine-alignment of tip to table hole, X (m)
+    _LEG_HOLE_OFFSET_Y: float = 0.001  # fine-alignment of tip to table hole, Y (m)
+
     def __init__(self, part_config, part_idx):
         super().__init__(part_config, part_idx)
         tag_ids = part_config["ids"]
@@ -38,6 +45,9 @@ class Leg(Part):
     def reset(self):
         super().reset()  # resets prev_cnt=0, curr_cnt=0, pre_assemble_done, etc.
         self._last_state = "reach_leg_floor_xy"
+        self.GOT_STUCK = False
+        self.prev_leg_tip_z_rel = float("inf")
+        self.prev_leg_z_vel_robot = float("inf")
         self.gripper_action = -1
         self.screw_mode = "standard"  # latent variable: "standard" or "alternate" (-90° Z offset)
         self.latent_offsets = {}  # per-state 3D position offsets, empty = no latent plan
@@ -159,7 +169,12 @@ class Leg(Part):
         table_hole_pos_robot = table_hole_pose_robot[:3, 3]
 
         # Top-level phase discriminators
-        leg_xy_near_hole = (leg_pose_robot[:2, 3] - table_hole_pos_robot[:2]).abs().sum() < 0.015
+        # Use leg tip (screw threads) rather than COM for the XY proximity check.
+        # Tip is LEG_TIP_OFFSET m in the -local-Y direction from the mesh origin.
+        LEG_TIP_OFFSET = self._LEG_TIP_OFFSET
+        leg_tip_xy = leg_pose_robot[:2, 3] - leg_pose_robot[:2, 1] * LEG_TIP_OFFSET
+        leg_xy_near_hole = torch.norm(leg_tip_xy - table_hole_pos_robot[:2]) < 0.009
+        leg_xy_near_hole_loose = torch.norm(leg_tip_xy - table_hole_pos_robot[:2]) < 0.015
         # gripper_grasped: leg is physically between the fingers.
         # When the leg (diameter = 2*half_width) is held, physics prevents the gripper
         # from closing below 2*half_width, so the reading stays near that value.
@@ -169,12 +184,12 @@ class Leg(Part):
         # A 0.005 m upper margin and 0.010 m lower margin accommodate measurement noise.
         leg_diameter = 2 * self.half_width
         gripper_grasped = (
-            gripper_width < leg_diameter + 0.005  # not open
+            gripper_width < leg_diameter + 0.0055  # not open
             and gripper_width > leg_diameter - 0.010  # not empty-closed
         )
 
         # Precompute orientations
-        margin = C.rot_mat_tensor(0, -np.pi / 5, 0, device)  # Ry(-36 deg)
+        margin = C.rot_mat_tensor(0, self._GRASP_MARGIN_ANGLE, 0, device)
         # grasp_ori: base floor-pickup orientation rotated around world-Z to match the
         # leg's current yaw (same logic as floor_grasp_ori() in fsm_step).
         #
@@ -206,6 +221,12 @@ class Leg(Part):
         table_top_z = table_pose_robot[2, 3]
         insert_z = table_top_z + 0.056
 
+        # Leg z-velocity in robot frame (rotate sim-frame velocity by the same
+        # combined rotation used for positions).
+        _leg_vel_sim = rb_states[part_idxs[self.name]][0][7:10]
+        _rot_sim_to_robot = (april_to_robot @ sim_to_april_mat)[:3, :3]
+        leg_z_vel_robot = (_rot_sim_to_robot @ _leg_vel_sim)[2]
+
         # Hard-coded INSERTED-phase orientations (mode-dependent).
         # Standard:  pre_screw = Rx(π)@Rz(π),   screw_done = Rx(π)           (−180° around Z)
         # Alternate: pre_screw = Rx(π)@Rz(π/2), screw_done = Rx(π)@Rz(−π/2) (same arc, −90° offset)
@@ -223,60 +244,55 @@ class Leg(Part):
         pre_screw_pos[2] = insert_z
         at_pre_screw_pos = (ee_pos - pre_screw_pos).abs().sum() < self.pos_error_threshold * 3
 
+        # Staging position during "match_leg_ori" and before "reach_table_top_xy"
+        self.staging_pos = torch.tensor([0.45, 0.15, 0.14], device=device)
+
         # ── Phase 1: GRASPED ─────────────────────────────────────────────────
         # Primary discriminator: leg is physically between the gripper fingers.
         if gripper_grasped:
+            ee_at_insert_ori = (ee_pose[:3, :3] - insert_ori).abs().sum() < self.ori_error_threshold * 3
             if leg_xy_near_hole:
                 # ── Screw vs Insertion sub-phase ─────────────────────────────
                 # Both "carrying the leg down for insertion" and "re-grasped for screwing"
                 # share the same XY proximity to the hole.  The EE orientation is the discriminator:
                 #   insert_ori (Ry(-36°) @ Rx(180°)) → still inserting
                 #   anything else                     → screw sub-phase
-                ee_at_insert_ori = (ee_pose[:3, :3] - insert_ori).abs().sum() < self.ori_error_threshold * 2
                 if ee_at_insert_ori:
                     # ── Insertion sub-phase ──────────────────────────────────
                     # EE is at insert_ori, descending to insert the leg.
                     leg_z_rel = leg_pose_robot[2, 3] - table_pose_robot[2, 3]
-                    if leg_z_rel < 0.056:  # fully inserted → release the leg
+                    leg_tip_z_rel = leg_z_rel - leg_pose_robot[2, 1] * LEG_TIP_OFFSET
+                    if leg_tip_z_rel < 0.0565 - LEG_TIP_OFFSET:  # fully inserted → release the leg
                         return "insert_release"
 
                     # Detect stuck: leg is in the insertion zone but tip XY is off-center from the hole.
                     # Tunable thresholds:
-                    STUCK_Z_LOW = 0.069  # just above the fully-inserted threshold
-                    STUCK_Z_HIGH = 0.07275  # upper bound of stuck zone (leg hasn't made progress)
-                    STUCK_XY_RADIUS = 0.005  # min distance from hole center to be considered stuck
-                    STUCK_Z_VEL_THRESHOLD = 0.03  # m/s — leg moving upward indicates it is trying the retry behavior
-                    # Leg z-velocity in robot frame (rotate sim-frame velocity by the same
-                    # combined rotation used for positions).
-                    leg_vel_sim = rb_states[part_idxs[self.name]][0][7:10]
-                    rot_sim_to_robot = (april_to_robot @ sim_to_april_mat)[:3, :3]
-                    leg_z_vel_robot = (rot_sim_to_robot @ leg_vel_sim)[2]
-                    z_range_stuck = leg_z_rel < STUCK_Z_HIGH
-                    z_vel_stuck = leg_z_vel_robot > STUCK_Z_VEL_THRESHOLD
-
-                    # hole_center_x = table_hole_pos_robot[0] + 0.003
-                    # hole_center_y = table_hole_pos_robot[1] + 0.002
-                    # # Tip (screw threads) is 0.05625 m in the -local-Y direction from the
-                    # # mesh origin. The local-Y column (col 1) of the rotation matrix gives
-                    # # the upward direction of the leg when inserted; the tip points down.
-                    # # Note: find_leg_pose_x_look_front only rotates about local-Y, so it
-                    # # preserves col 1 — safe to read directly from leg_pose_robot here.
-                    # LEG_TIP_OFFSET = 0.05625
-                    # leg_tip_xy = leg_pose_robot[:2, 3] - leg_pose_robot[:2, 1] * LEG_TIP_OFFSET
-                    # print(f"leg_tip_xy: {leg_tip_xy}")
-                    # print(f"hole_center: {hole_center_x}, {hole_center_y}")
-                    # print(f"leg_com xy: {leg_pose_robot[:2, 3]}")
-                    # dist_from_hole_center = torch.sqrt(
-                    #     (leg_tip_xy[0] - hole_center_x) ** 2 + (leg_tip_xy[1] - hole_center_y) ** 2
-                    # )
-                    print(f"leg_z_rel: {leg_z_rel}, leg_z_vel_robot: {leg_z_vel_robot}")
+                    STUCK_Z_LOW = 0.01475  # Below this means the leg is inserted
+                    STUCK_Z_HIGH = 0.01675  # upper bound of stuck zone (leg hasn't made progress)
+                    STUCK_Z_VEL_THRESHOLD = 0.025  # m/s — leg moving upward indicates it is trying the retry behavior
+                    # 2-markovian -- check that previous state also stuck
+                    z_range_stuck = leg_tip_z_rel < STUCK_Z_HIGH and self.prev_leg_tip_z_rel < STUCK_Z_HIGH
+                    self.prev_leg_tip_z_rel = leg_tip_z_rel  # This is the last time leg_tip_z_rel is used in this func.
+                    z_vel_stuck = (
+                        leg_z_vel_robot > STUCK_Z_VEL_THRESHOLD
+                    )  # If robot is already moving upward, i.e. already backing out for retry, then continue doing so
+                    print(f"leg_tip_z_rel: {leg_tip_z_rel}, leg_z_vel_robot: {leg_z_vel_robot}")
                     if (
-                        # dist_from_hole_center > STUCK_XY_RADIUS
-                        leg_z_rel > STUCK_Z_LOW
-                        and leg_z_vel_robot > -0.001  # Leg is not moving downward
+                        leg_tip_z_rel > STUCK_Z_LOW  # Don't trigger stuck if leg is inserted
+                        and leg_z_vel_robot > -0.05  # Leg is not moving downward
+                        and self.prev_leg_z_vel_robot > -0.05  # Leg was not moving downward in the previous step
                         and (z_range_stuck or z_vel_stuck)
                     ):
-                        return "back_out_for_retry"
+                        self.GOT_STUCK = True
+                        # return "back_out_for_retry"
+                        print("GOT_STUCK -- returning to reach_table_top_xy")
+                        self.prev_leg_z_vel_robot = (
+                            leg_z_vel_robot  # This is the last time leg_z_vel_robot is used in this func.
+                        )
+                        return "reach_table_top_xy"
+                    self.prev_leg_z_vel_robot = (
+                        leg_z_vel_robot  # This is the last time leg_z_vel_robot is used in this func.
+                    )
                     return "reach_table_top_z"  # descending to insert the leg
 
                 else:
@@ -287,20 +303,31 @@ class Leg(Part):
                         return "release"
                     return "screw"
 
+            # Sometimes, due to action noise, leg_xy_near_hole may become untrue momentarily.
+            # If the leg is still close to the hole and the robot is moving downward, we know we're probably still in
+            # "reach_table_top_xy".
+            elif leg_xy_near_hole_loose and leg_z_vel_robot < -0.06 and ee_at_insert_ori:
+                return "reach_table_top_z"  # descending to insert the leg
+
             else:
                 # ── Transport sub-phase ──────────────────────────────────────
                 # Leg is grasped and the EE is not yet over the hole.
                 # Navigate in order: lift → center → orient → fly to hole.
 
+                # "match_leg_ori": leg is lifted (Z > 0.05 m) after "lift_up" → move to the
+                # staging position and rotate to insert_ori.
+                # For safety, after getting far enough away from staging_pos, we don't return to "match_leg_ori"
+                if (
+                    leg_pose_robot[2, 3] > 0.05
+                    and (ee_pose[:3, :3] - insert_ori).abs().sum() > self.ori_error_threshold * 4
+                    and (ee_pos[:2] - self.staging_pos[:2]).abs().sum() < 0.2
+                ):
+                    return "match_leg_ori"
+
                 # "reach_table_top_xy": EE orientation already matches insert_ori
                 # (Ry(-36°) @ Rx(180°)) → fly EE XY to the hole position.
-                if (ee_pose[:3, :3] - insert_ori).abs().sum() < self.ori_error_threshold * 3:
+                if (ee_pose[:3, :3] - insert_ori).abs().sum() <= self.ori_error_threshold * 4:
                     return "reach_table_top_xy"
-
-                # "match_leg_ori": leg is lifted (Z > 0.05 m) → move to the
-                # staging position [0.57, 0.1, 0.12] and rotate to insert_ori.
-                if leg_pose_robot[2, 3] > 0.05:
-                    return "match_leg_ori"
 
                 # "lift_up": default — leg just grasped and still near the
                 # floor (leg Z ≤ 0.05 m) → lift until leg clears the floor.
@@ -334,9 +361,9 @@ class Leg(Part):
             # Gate on XY proximity between EE and leg.
             if (ee_pos[:2] - leg_xy).abs().sum() < self.pos_error_threshold * 4:
                 # Gate on orientation alignment between EE and leg.
-                if (ee_pose[:3, :3] - grasp_ori).abs().sum() < self.ori_error_threshold * 1.5:
+                if (ee_pose[:3, :3] - grasp_ori).abs().sum() < self.ori_error_threshold * 3:
                     # Gate on Z proximity between EE and leg.
-                    if abs(ee_pos[2] - leg_z) < self.pos_error_threshold * 2:
+                    if abs(ee_pos[2] - leg_z) < self.pos_error_threshold * 4:
                         return "pick_leg"  # Ready to pick up the leg.
 
                     return "reach_leg_floor_z"  # EE is at leg XY + grasp_ori but above the leg → descend to leg Z.
@@ -453,7 +480,7 @@ class Leg(Part):
         table_pose = sim_to_april_mat @ table_pose
         leg_pose = sim_to_april_mat @ leg_pose
 
-        margin = C.rot_mat_tensor(0, -np.pi / 5, 0, ee_pose.device)
+        margin = C.rot_mat_tensor(0, self._GRASP_MARGIN_ANGLE, 0, ee_pose.device)
         device = ee_pose.device
 
         def find_leg_pose_x_look_front(leg_pose):
@@ -469,6 +496,26 @@ class Leg(Part):
         # Default target to current EE pose (overridden in each state)
         target = ee_pose.clone()
         clean_target = ee_pose.clone()
+
+        LEG_TIP_OFFSET = self._LEG_TIP_OFFSET
+        LEG_HOLE_OFFSET_X = self._LEG_HOLE_OFFSET_X
+        LEG_HOLE_OFFSET_Y = self._LEG_HOLE_OFFSET_Y
+
+        # Precompute for states that navigate relative to the leg tip and table hole
+        # (reach_table_top_xy, reach_table_top_z, insert_release).
+        # find_leg_pose_x_look_front only applies Ry rotations, so col-1 (local-Y) is preserved.
+        leg_pose_robot = find_leg_pose_x_look_front(april_to_robot @ leg_pose)
+        leg_tip_pose_robot = leg_pose_robot.clone()
+        leg_tip_pose_robot[:3, 3] = leg_pose_robot[:3, 3] - leg_pose_robot[:3, 1] * LEG_TIP_OFFSET
+        # Pose of the table hole in the robot frame.
+        table_hole_pose_robot = (
+            april_to_robot
+            @ table_pose
+            @ torch.tensor(
+                get_mat(self.default_assembled_pose[:3, 3], [0.0, 0.0, 0.0]),
+                device=device,
+            )
+        )
 
         if state == "reach_leg_floor_xy":
             leg_pose_down = self._find_down_z(leg_pose).clone().to(device)
@@ -490,7 +537,6 @@ class Leg(Part):
             target_ori = R_z_delta @ ee_pose[:3, :3]
             target_pos[2] = ee_pos[2]
             # target_pos[1] += 0.01
-            print(f"grasp_margin_x: {0.005}")
             target_pos[0] += 0.005
             clean_target = C.to_homogeneous(target_pos, target_ori)
             clean_target = self._apply_latent_offset(state, clean_target)
@@ -504,50 +550,46 @@ class Leg(Part):
             target_ori = floor_grasp_ori(leg_pose_down)
             leg_pos_robot = (april_to_robot @ leg_pose_down[:4, 3])[:3]
             target_pos = leg_pos_robot.clone()
-            target_pos[2] = ee_pos[2]
-            # target_pos[1] += 0.01
-            target_pos[0] += 0.005
-            target_pos[2] -= 0.005
+            target_pos[0] = leg_pos_robot[0] + 0.01  # Grab 1cm closer to the "top" of the leg
+            target_pos[2] = leg_pos_robot[2] + 0.05  # High z value -- keep clearance above leg during EE rotation
             clean_target = C.to_homogeneous(target_pos, target_ori)
             clean_target = self._apply_latent_offset(state, clean_target)
-            target = self._add_noise(clean_target, pos_std=0.003, ori_std_deg=3.0)
+            target = self._add_noise(clean_target, pos_std=0.004, ori_std_deg=3.0)
             result = self.satisfy(ee_pose, target, pos_error_threshold=0.015, ori_error_threshold=0.1, max_len=150)
             if result == "TIMEOUT":
                 timeout_failure = True
         elif state == "reach_leg_floor_z":
             leg_pose_down = self._find_down_z(leg_pose).clone().to(device)
             target_ori = floor_grasp_ori(leg_pose_down)
-            leg_pos_robot = (april_to_robot @ leg_pose_down[:4, 3])[:3]
+            leg_pos_robot = (april_to_robot @ leg_pose_down[:4, 3])[:3]  # leg COM in the robot frame
             target_pos = leg_pos_robot.clone()
-            # target_pos[1] += 0.01
-            target_pos[0] += 0.005
-            target_pos[2] = (april_to_robot @ leg_pose)[2, 3]
+            target_pos[0] = leg_pos_robot[0] + 0.01  # Grab 1cm closer to the "top" of the leg
+            target_pos[2] = leg_pos_robot[2] + 0.012  # Pick 1.2cm above the leg COM
             clean_target = C.to_homogeneous(target_pos, target_ori)
             clean_target = self._apply_latent_offset(state, clean_target)
-            target = self._add_noise(clean_target, pos_std=0.0015, ori_std_deg=1.5)
+            target = self._add_noise(clean_target, pos_std=0.0005, ori_std_deg=0.5)
             result = self.satisfy(ee_pose, target, pos_error_threshold=0.015, ori_error_threshold=0.3, max_len=150)
             if result == "TIMEOUT":
                 timeout_failure = True
         elif state == "pick_leg":
             leg_pose_down = self._find_down_z(leg_pose).clone().to(device)
             target_ori = floor_grasp_ori(leg_pose_down)
-            leg_pos_robot = (april_to_robot @ leg_pose_down[:4, 3])[:3]
+            leg_pos_robot = (april_to_robot @ leg_pose_down[:4, 3])[:3]  # leg COM in the robot frame
             target_pos = leg_pos_robot.clone()
-            # target_pos[1] += 0.01
-            target_pos[0] += 0.005
-            target_pos[2] = (april_to_robot @ leg_pose)[2, 3]
+            target_pos[0] = leg_pos_robot[0] + 0.01  # Grab 1cm closer to the "top" of the leg
+            target_pos[2] = leg_pos_robot[2] + 0.012  # Pick 1.2cm above the leg COM
             clean_target = C.to_homogeneous(target_pos, target_ori)
             clean_target = self._apply_latent_offset(state, clean_target)
-            target = self._add_noise(clean_target, pos_std=0.003, ori_std_deg=3.0)
+            target = self._add_noise(clean_target, pos_std=0.0005, ori_std_deg=0.5)
             self.gripper_action = 1
             result = self.gripper_less(gripper_width, 2 * self.half_width + 0.001)
             if result == "TIMEOUT":
                 timeout_failure = True
         elif state == "lift_up":
             leg_pose_down = self._find_down_z(leg_pose).clone().to(device)
-            leg_pos_robot = (april_to_robot @ leg_pose_down[:4, 3])[:3]
+            leg_pos_robot = (april_to_robot @ leg_pose_down[:4, 3])[:3]  # leg COM in the robot frame
             target_pos = leg_pos_robot.clone()
-            target_pos[2] += 0.10
+            target_pos[2] += 0.06
             target_ori = ee_pose[:3, :3]
             clean_target = C.to_homogeneous(target_pos, target_ori)
             clean_target = self._apply_latent_offset(state, clean_target)
@@ -557,93 +599,53 @@ class Leg(Part):
                 timeout_failure = True
         elif state == "match_leg_ori":
             target_ori = (margin @ C.rot_mat_tensor(np.pi, 0, 0, device))[:3, :3]
-            target_pos = torch.tensor([0.57, 0.1, 0.12], device=device)
+            target_pos = self.staging_pos
             clean_target = C.to_homogeneous(target_pos, target_ori)
             clean_target = self._apply_latent_offset(state, clean_target)
-            target = self._add_noise(clean_target)
+            target = self._add_noise(clean_target, pos_std=0.002, ori_std_deg=0.5)
             result = self.satisfy(ee_pose, target, pos_error_threshold=0.02, ori_error_threshold=0.3, max_len=150)
             if result == "TIMEOUT":
                 timeout_failure = True
-        elif state == "reach_table_top_xy":
-            leg_pose_robot = april_to_robot @ leg_pose
-            leg_pose_robot = find_leg_pose_x_look_front(leg_pose_robot)
-            table_hole_pose_robot = (
-                april_to_robot
-                @ table_pose
-                @ torch.tensor(
-                    get_mat(self.default_assembled_pose[:3, 3], [0.0, 0.0, 0.0]),
-                    device=device,
-                )
-            )
-            target_leg_pose_robot = torch.tensor(
-                [  # 0.004 and 0.002 are empirical offsets to make the leg align perfectly with the table hole
-                    [1.0, 0.0, 0.0, table_hole_pose_robot[0, 3] + 0.01],
-                    [0.0, 0.0, -1.0, table_hole_pose_robot[1, 3] + 0.002],
-                    [0.0, 1.0, 0.0, table_pose[2, 3] + 0.14],
+        elif state == "reach_table_top_xy" or state == "back_out_for_retry":
+            target_z = 0.14 if state == "reach_table_top_xy" else 0.1
+            target_leg_tip_pose_robot = torch.tensor(
+                [  # Target for leg TIP: LEG_HOLE_OFFSET_X/Y align tip with table hole
+                    [1.0, 0.0, 0.0, table_hole_pose_robot[0, 3] + LEG_HOLE_OFFSET_X],
+                    [0.0, 0.0, -1.0, table_hole_pose_robot[1, 3] + LEG_HOLE_OFFSET_Y],
+                    [0.0, 1.0, 0.0, table_pose[2, 3] + target_z - LEG_TIP_OFFSET],
                     [0.0, 0.0, 0.0, 1.0],
                 ],
                 device=device,
             )
-            rel = rel_rot_mat(leg_pose_robot, target_leg_pose_robot)
+            rel = rel_rot_mat(leg_tip_pose_robot, target_leg_tip_pose_robot)
             clean_target = rel @ ee_pose
             clean_target = self._apply_latent_offset(state, clean_target)
-            target = self._add_noise(clean_target, pos_std=0.003, ori_std_deg=3.0)
-            result = self.satisfy(ee_pose, target, pos_error_threshold=0.015, ori_error_threshold=0.3, max_len=150)
-            if result == "TIMEOUT":
-                timeout_failure = True
-        elif state == "back_out_for_retry":
-            # Back out to the reach_table_top_xy approach height and try alignment again.
-            # Identical target to reach_table_top_xy but with higher noise to escape the stuck position.
-            leg_pose_robot = april_to_robot @ leg_pose
-            leg_pose_robot = find_leg_pose_x_look_front(leg_pose_robot)
-            table_hole_pose_robot = (
-                april_to_robot
-                @ table_pose
-                @ torch.tensor(
-                    get_mat(self.default_assembled_pose[:3, 3], [0.0, 0.0, 0.0]),
-                    device=device,
-                )
-            )
-            target_leg_pose_robot = torch.tensor(
-                [  # Same target as reach_table_top_xy: back out to approach height above the hole
-                    [1.0, 0.0, 0.0, table_hole_pose_robot[0, 3] + 0.01],
-                    [0.0, 0.0, -1.0, table_hole_pose_robot[1, 3] + 0.002],
-                    [0.0, 1.0, 0.0, table_pose[2, 3] + 0.085],
-                    [0.0, 0.0, 0.0, 1.0],
-                ],
-                device=device,
-            )
-            rel = rel_rot_mat(leg_pose_robot, target_leg_pose_robot)
-            clean_target = rel @ ee_pose
-            clean_target = self._apply_latent_offset(state, clean_target)
-            target = self._add_noise(clean_target, pos_std=0.001, ori_std_deg=1.5)
+            target = self._add_noise(clean_target, pos_std=0.002, ori_std_deg=0.5)
             result = self.satisfy(ee_pose, target, pos_error_threshold=0.015, ori_error_threshold=0.3, max_len=150)
             if result == "TIMEOUT":
                 timeout_failure = True
         elif state == "reach_table_top_z":
-            leg_pose_robot = april_to_robot @ leg_pose
-            leg_pose_robot = find_leg_pose_x_look_front(leg_pose_robot)
-            table_hole_pose_robot = (
-                april_to_robot
-                @ table_pose
-                @ torch.tensor(
-                    get_mat(self.default_assembled_pose[:3, 3], [0.0, 0.0, 0.0]),
-                    device=device,
-                )
-            )
-            target_leg_pose_robot = torch.tensor(
-                [  # 0.004 and 0.002 are empirical offsets to make the leg align perfectly with the table hole
-                    [1.0, 0.0, 0.0, table_hole_pose_robot[0, 3] + 0.01],
-                    [0.0, 0.0, -1.0, table_hole_pose_robot[1, 3] + 0.002],
-                    [0.0, 1.0, 0.0, table_pose[2, 3] + 0.05],
+            target_leg_tip_pose_robot = torch.tensor(
+                [  # Target for leg TIP: LEG_HOLE_OFFSET_X/Y align tip with table hole
+                    [1.0, 0.0, 0.0, table_hole_pose_robot[0, 3] + LEG_HOLE_OFFSET_X],
+                    [0.0, 0.0, -1.0, table_hole_pose_robot[1, 3] + LEG_HOLE_OFFSET_Y],
+                    [0.0, 1.0, 0.0, table_pose[2, 3] + 0.05 - LEG_TIP_OFFSET],
                     [0.0, 0.0, 0.0, 1.0],
                 ],
                 device=device,
             )
-            rel = rel_rot_mat(leg_pose_robot, target_leg_pose_robot)
+            rel = rel_rot_mat(leg_tip_pose_robot, target_leg_tip_pose_robot)
             clean_target = rel @ ee_pose
             clean_target = self._apply_latent_offset(state, clean_target)
-            target = self._add_noise(clean_target, pos_std=0.0, ori_std_deg=0.0)
+            # Don't add as much noise if the leg got stuck
+            # Note that this is non-markovian but doesn't make the policy non-markovian,
+            # since this only affects the noise added during simulation, doesn't affect the actual recorded actions.
+            if not self.GOT_STUCK:
+                target = self._add_noise(
+                    clean_target, pos_std=0.004, pos_std_z=0.0, ori_std_deg=2.5, pos_max=0.005, ori_max_deg=4.0
+                )
+            else:
+                target = self._add_noise(clean_target, pos_std=0.0, ori_std_deg=0.0)
             result = self.satisfy(ee_pose, target, pos_error_threshold=0.007, ori_error_threshold=0.15, max_len=75)
             if result == "TIMEOUT":
                 timeout_failure = True
@@ -653,26 +655,16 @@ class Leg(Part):
             # then move upward to the pre-screw position.
             gripper_cleared_leg = gripper_width >= 2 * self.half_width + 0.010
             if gripper_cleared_leg:
-                leg_pose_robot = april_to_robot @ leg_pose
-                leg_pose_robot = find_leg_pose_x_look_front(leg_pose_robot)
-                table_hole_pose_robot = (
-                    april_to_robot
-                    @ table_pose
-                    @ torch.tensor(
-                        get_mat(self.default_assembled_pose[:3, 3], [0.0, 0.0, 0.0]),
-                        device=device,
-                    )
-                )
-                target_leg_pose_robot = torch.tensor(
-                    [  # 0.004 and 0.002 are empirical offsets to make the leg align perfectly with the table hole
-                        [1.0, 0.0, 0.0, table_hole_pose_robot[0, 3] + 0.01],
-                        [0.0, 0.0, -1.0, table_hole_pose_robot[1, 3] + 0.002],
-                        [0.0, 1.0, 0.0, table_pose[2, 3] + 0.084],
+                target_leg_tip_pose_robot = torch.tensor(
+                    [  # Target for leg TIP: LEG_HOLE_OFFSET_X/Y align tip with table hole
+                        [1.0, 0.0, 0.0, table_hole_pose_robot[0, 3] + LEG_HOLE_OFFSET_X],
+                        [0.0, 0.0, -1.0, table_hole_pose_robot[1, 3] + LEG_HOLE_OFFSET_Y],
+                        [0.0, 1.0, 0.0, table_pose[2, 3] + 0.084 - LEG_TIP_OFFSET],
                         [0.0, 0.0, 0.0, 1.0],
                     ],
                     device=device,
                 )
-                rel = rel_rot_mat(leg_pose_robot, target_leg_pose_robot)
+                rel = rel_rot_mat(leg_tip_pose_robot, target_leg_tip_pose_robot)
                 clean_target = rel @ ee_pose
                 clean_target = self._apply_latent_offset(state, clean_target)
                 target = self._add_noise(clean_target, pos_std=0.001, ori_std_deg=1.0)
@@ -709,8 +701,9 @@ class Leg(Part):
 
             # 2-stage sequence: first right the gripper (so it is vertical); then, rotate +180 deg about
             # world-Z to pre_screw_ori.
-            if ee_z_dot_down < 0.99:
-                # Phase 1: right the gripper (same for both modes).
+            print(f"ee_z_dot_down: {ee_z_dot_down}")
+            if ee_z_dot_down < 0.9975:
+                # Phase 1: right the gripper vertically
                 target_ori = C.rot_mat_tensor(np.pi, 0, 0, device)[:3, :3]
             elif self.screw_mode == "alternate":
                 ee_x_dot_world_y = ee_pose[1, 0]
@@ -759,18 +752,6 @@ class Leg(Part):
             # Rotate EE -180° about global Z from pre_screw back to Rx(π).
             # Split into two 90° steps (same technique as pre_screw) to avoid rotational ambiguity.
             ee_x_dot_world_x = ee_pose[0, 0]
-            # # Anchor XY to the table hole (stable external reference) to provide a restoring
-            # # force against any XY perturbations (e.g. table_top sliding during screwing).
-            # table_hole_pose_robot = (
-            #     april_to_robot
-            #     @ table_pose
-            #     @ torch.tensor(
-            #         get_mat(self.default_assembled_pose[:3, 3], [0.0, 0.0, 0.0]),
-            #         device=device,
-            #     ).float()
-            # )
-            # target_pos = table_hole_pose_robot[:3, 3].clone()
-            # target_pos[2] = ee_pos[2] - 0.005  # keep downward pressure while screwing
 
             # Simply hard-code target position during screwing
             # Note: intentionally make the target height during screwing 1mm above the height during screw_grasp
@@ -784,19 +765,7 @@ class Leg(Part):
                 device=ee_pos.device,
                 dtype=ee_pos.dtype,
             )
-            # target_pos = ee_pos[:3].clone()
-            # target_pos[2] = 0.055
-            # target_pos[2] += 0.001
-            # target_pos[2] = ee_pos[2] - 0.004  # keep downward pressure while screwing
-            print(f"target_pos: {target_pos}")
 
-            # print("abs(ee_pos[0] - TARGET_EE_POS[0]):", abs(ee_pos[0] - TARGET_EE_POS[0]))
-            # print("abs(ee_pos[1] - TARGET_EE_POS[1]):", abs(ee_pos[1] - TARGET_EE_POS[1]))
-
-            # if abs(ee_pos[0] - TARGET_EE_POS[0]) > 0.0025 or abs(ee_pos[1] - TARGET_EE_POS[1]) > 0.0025:
-            #     current_yaw = torch.atan2(ee_pose[1, 0], ee_pose[0, 0])
-            #     target_ori = C.rot_mat_tensor(np.pi, 0, current_yaw.item(), device)[:3, :3]
-            # else:
             if self.screw_mode == "alternate":
                 ee_x_dot_world_y = ee_pose[1, 0]
                 if ee_x_dot_world_y > 0.75:
@@ -847,6 +816,15 @@ class Leg(Part):
     def state_no_noise(self):
         return self._last_state in [
             "insert_release",
+        ]
+
+    def state_low_action_noise(self):
+        # Add just action noise (but no target noise) for screwing states
+        return self._last_state in [
+            "reach_table_top_z",
+            "pre_screw",
+            "screw_grasp",
+            "screw",
         ]
 
     def _find_closest_y(self, pose):
