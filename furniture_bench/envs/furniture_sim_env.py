@@ -822,9 +822,10 @@ class FurnitureSimEnv(gym.Env):
                 self.isaac_gym.set_dof_actuation_force_tensor(self.sim, gymtorch.unwrap_tensor(torque_action))
 
             # Update viewer
+            self.isaac_gym.draw_viewer(self.viewer, self.sim, False)
             if not self.headless and _substep == self.sim_steps - 1:
-                self.isaac_gym.draw_viewer(self.viewer, self.sim, False)
-                # self.isaac_gym.sync_frame_time(self.sim)
+                # self.isaac_gym.draw_viewer(self.viewer, self.sim, False)
+                self.isaac_gym.sync_frame_time(self.sim)
                 self.isaac_gym.clear_lines(self.viewer)
 
         self.isaac_gym.end_access_image_tensors(self.sim)

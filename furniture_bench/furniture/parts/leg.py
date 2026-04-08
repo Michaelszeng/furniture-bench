@@ -62,6 +62,7 @@ class Leg(Part):
             "lift_up",
             "match_leg_ori",
             "reach_table_top_xy",
+            "back_out_for_retry",
             "reach_table_top_z",
             "insert_release",
             "release",
@@ -235,11 +236,47 @@ class Leg(Part):
                 if ee_at_insert_ori:
                     # ── Insertion sub-phase ──────────────────────────────────
                     # EE is at insert_ori, descending to insert the leg.
-                    print(
-                        f"leg_pose_robot[2, 3] - table_pose_robot[2, 3]: {leg_pose_robot[2, 3] - table_pose_robot[2, 3]}"
-                    )
-                    if leg_pose_robot[2, 3] - table_pose_robot[2, 3] < 0.056:  # fully inserted → release the leg
+                    leg_z_rel = leg_pose_robot[2, 3] - table_pose_robot[2, 3]
+                    if leg_z_rel < 0.056:  # fully inserted → release the leg
                         return "insert_release"
+
+                    # Detect stuck: leg is in the insertion zone but tip XY is off-center from the hole.
+                    # Tunable thresholds:
+                    STUCK_Z_LOW = 0.069  # just above the fully-inserted threshold
+                    STUCK_Z_HIGH = 0.07275  # upper bound of stuck zone (leg hasn't made progress)
+                    STUCK_XY_RADIUS = 0.005  # min distance from hole center to be considered stuck
+                    STUCK_Z_VEL_THRESHOLD = 0.03  # m/s — leg moving upward indicates it is trying the retry behavior
+                    # Leg z-velocity in robot frame (rotate sim-frame velocity by the same
+                    # combined rotation used for positions).
+                    leg_vel_sim = rb_states[part_idxs[self.name]][0][7:10]
+                    rot_sim_to_robot = (april_to_robot @ sim_to_april_mat)[:3, :3]
+                    leg_z_vel_robot = (rot_sim_to_robot @ leg_vel_sim)[2]
+                    z_range_stuck = leg_z_rel < STUCK_Z_HIGH
+                    z_vel_stuck = leg_z_vel_robot > STUCK_Z_VEL_THRESHOLD
+
+                    # hole_center_x = table_hole_pos_robot[0] + 0.003
+                    # hole_center_y = table_hole_pos_robot[1] + 0.002
+                    # # Tip (screw threads) is 0.05625 m in the -local-Y direction from the
+                    # # mesh origin. The local-Y column (col 1) of the rotation matrix gives
+                    # # the upward direction of the leg when inserted; the tip points down.
+                    # # Note: find_leg_pose_x_look_front only rotates about local-Y, so it
+                    # # preserves col 1 — safe to read directly from leg_pose_robot here.
+                    # LEG_TIP_OFFSET = 0.05625
+                    # leg_tip_xy = leg_pose_robot[:2, 3] - leg_pose_robot[:2, 1] * LEG_TIP_OFFSET
+                    # print(f"leg_tip_xy: {leg_tip_xy}")
+                    # print(f"hole_center: {hole_center_x}, {hole_center_y}")
+                    # print(f"leg_com xy: {leg_pose_robot[:2, 3]}")
+                    # dist_from_hole_center = torch.sqrt(
+                    #     (leg_tip_xy[0] - hole_center_x) ** 2 + (leg_tip_xy[1] - hole_center_y) ** 2
+                    # )
+                    print(f"leg_z_rel: {leg_z_rel}, leg_z_vel_robot: {leg_z_vel_robot}")
+                    if (
+                        # dist_from_hole_center > STUCK_XY_RADIUS
+                        leg_z_rel > STUCK_Z_LOW
+                        and leg_z_vel_robot > -0.001  # Leg is not moving downward
+                        and (z_range_stuck or z_vel_stuck)
+                    ):
+                        return "back_out_for_retry"
                     return "reach_table_top_z"  # descending to insert the leg
 
                 else:
@@ -540,7 +577,7 @@ class Leg(Part):
             )
             target_leg_pose_robot = torch.tensor(
                 [  # 0.003 and 0.002 are empirical offsets to make the leg align perfectly with the table hole
-                    [1.0, 0.0, 0.0, table_hole_pose_robot[0, 3] + 0.003],
+                    [1.0, 0.0, 0.0, table_hole_pose_robot[0, 3]],
                     [0.0, 0.0, -1.0, table_hole_pose_robot[1, 3] + 0.002],
                     [0.0, 1.0, 0.0, table_pose[2, 3] + 0.14],
                     [0.0, 0.0, 0.0, 1.0],
@@ -551,6 +588,35 @@ class Leg(Part):
             clean_target = rel @ ee_pose
             clean_target = self._apply_latent_offset(state, clean_target)
             target = self._add_noise(clean_target, pos_std=0.003, ori_std_deg=3.0)
+            result = self.satisfy(ee_pose, target, pos_error_threshold=0.015, ori_error_threshold=0.3, max_len=150)
+            if result == "TIMEOUT":
+                timeout_failure = True
+        elif state == "back_out_for_retry":
+            # Back out to the reach_table_top_xy approach height and try alignment again.
+            # Identical target to reach_table_top_xy but with higher noise to escape the stuck position.
+            leg_pose_robot = april_to_robot @ leg_pose
+            leg_pose_robot = find_leg_pose_x_look_front(leg_pose_robot)
+            table_hole_pose_robot = (
+                april_to_robot
+                @ table_pose
+                @ torch.tensor(
+                    get_mat(self.default_assembled_pose[:3, 3], [0.0, 0.0, 0.0]),
+                    device=device,
+                )
+            )
+            target_leg_pose_robot = torch.tensor(
+                [  # Same target as reach_table_top_xy: back out to approach height above the hole
+                    [1.0, 0.0, 0.0, table_hole_pose_robot[0, 3]],
+                    [0.0, 0.0, -1.0, table_hole_pose_robot[1, 3] + 0.002],
+                    [0.0, 1.0, 0.0, table_pose[2, 3] + 0.14],
+                    [0.0, 0.0, 0.0, 1.0],
+                ],
+                device=device,
+            )
+            rel = rel_rot_mat(leg_pose_robot, target_leg_pose_robot)
+            clean_target = rel @ ee_pose
+            clean_target = self._apply_latent_offset(state, clean_target)
+            target = self._add_noise(clean_target, pos_std=0.001, ori_std_deg=1.5)
             result = self.satisfy(ee_pose, target, pos_error_threshold=0.015, ori_error_threshold=0.3, max_len=150)
             if result == "TIMEOUT":
                 timeout_failure = True
@@ -567,8 +633,8 @@ class Leg(Part):
             )
             target_leg_pose_robot = torch.tensor(
                 [  # 0.003 and 0.002 are empirical offsets to make the leg align perfectly with the table hole
-                    [1.0, 0.0, 0.0, table_hole_pose_robot[0, 3] + 0.003],
-                    [0.0, 0.0, -1.0, table_hole_pose_robot[1, 3] + 0.012],
+                    [1.0, 0.0, 0.0, table_hole_pose_robot[0, 3]],
+                    [0.0, 0.0, -1.0, table_hole_pose_robot[1, 3] + 0.002],
                     [0.0, 1.0, 0.0, table_pose[2, 3] + 0.05],
                     [0.0, 0.0, 0.0, 1.0],
                 ],
@@ -577,7 +643,7 @@ class Leg(Part):
             rel = rel_rot_mat(leg_pose_robot, target_leg_pose_robot)
             clean_target = rel @ ee_pose
             clean_target = self._apply_latent_offset(state, clean_target)
-            target = self._add_noise(clean_target, pos_std=0.001, ori_std_deg=1.0)
+            target = self._add_noise(clean_target, pos_std=0.0, ori_std_deg=0.0)
             result = self.satisfy(ee_pose, target, pos_error_threshold=0.007, ori_error_threshold=0.15, max_len=75)
             if result == "TIMEOUT":
                 timeout_failure = True
@@ -599,8 +665,8 @@ class Leg(Part):
                 )
                 target_leg_pose_robot = torch.tensor(
                     [  # 0.003 and 0.002 are empirical offsets to make the leg align perfectly with the table hole
-                        [1.0, 0.0, 0.0, table_hole_pose_robot[0, 3] + 0.003],
-                        [0.0, 0.0, -1.0, table_hole_pose_robot[1, 3] + 0.012],
+                        [1.0, 0.0, 0.0, table_hole_pose_robot[0, 3]],
+                        [0.0, 0.0, -1.0, table_hole_pose_robot[1, 3] + 0.002],
                         [0.0, 1.0, 0.0, table_pose[2, 3] + 0.084],
                         [0.0, 0.0, 0.0, 1.0],
                     ],
