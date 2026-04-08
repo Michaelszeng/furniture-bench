@@ -576,8 +576,8 @@ class Leg(Part):
                 )
             )
             target_leg_pose_robot = torch.tensor(
-                [  # 0.003 and 0.002 are empirical offsets to make the leg align perfectly with the table hole
-                    [1.0, 0.0, 0.0, table_hole_pose_robot[0, 3]],
+                [  # 0.004 and 0.002 are empirical offsets to make the leg align perfectly with the table hole
+                    [1.0, 0.0, 0.0, table_hole_pose_robot[0, 3] + 0.01],
                     [0.0, 0.0, -1.0, table_hole_pose_robot[1, 3] + 0.002],
                     [0.0, 1.0, 0.0, table_pose[2, 3] + 0.14],
                     [0.0, 0.0, 0.0, 1.0],
@@ -606,9 +606,9 @@ class Leg(Part):
             )
             target_leg_pose_robot = torch.tensor(
                 [  # Same target as reach_table_top_xy: back out to approach height above the hole
-                    [1.0, 0.0, 0.0, table_hole_pose_robot[0, 3]],
+                    [1.0, 0.0, 0.0, table_hole_pose_robot[0, 3] + 0.01],
                     [0.0, 0.0, -1.0, table_hole_pose_robot[1, 3] + 0.002],
-                    [0.0, 1.0, 0.0, table_pose[2, 3] + 0.14],
+                    [0.0, 1.0, 0.0, table_pose[2, 3] + 0.085],
                     [0.0, 0.0, 0.0, 1.0],
                 ],
                 device=device,
@@ -632,8 +632,8 @@ class Leg(Part):
                 )
             )
             target_leg_pose_robot = torch.tensor(
-                [  # 0.003 and 0.002 are empirical offsets to make the leg align perfectly with the table hole
-                    [1.0, 0.0, 0.0, table_hole_pose_robot[0, 3]],
+                [  # 0.004 and 0.002 are empirical offsets to make the leg align perfectly with the table hole
+                    [1.0, 0.0, 0.0, table_hole_pose_robot[0, 3] + 0.01],
                     [0.0, 0.0, -1.0, table_hole_pose_robot[1, 3] + 0.002],
                     [0.0, 1.0, 0.0, table_pose[2, 3] + 0.05],
                     [0.0, 0.0, 0.0, 1.0],
@@ -664,8 +664,8 @@ class Leg(Part):
                     )
                 )
                 target_leg_pose_robot = torch.tensor(
-                    [  # 0.003 and 0.002 are empirical offsets to make the leg align perfectly with the table hole
-                        [1.0, 0.0, 0.0, table_hole_pose_robot[0, 3]],
+                    [  # 0.004 and 0.002 are empirical offsets to make the leg align perfectly with the table hole
+                        [1.0, 0.0, 0.0, table_hole_pose_robot[0, 3] + 0.01],
                         [0.0, 0.0, -1.0, table_hole_pose_robot[1, 3] + 0.002],
                         [0.0, 1.0, 0.0, table_pose[2, 3] + 0.084],
                         [0.0, 0.0, 0.0, 1.0],
