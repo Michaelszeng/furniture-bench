@@ -16,7 +16,7 @@ class Leg(Part):
     # Ry angle (radians) that pitches the EE toward the floor during the floor pick-up.
     # Adjust here to change the grasp tilt; used identically in compute_state and fsm_step.
     _GRASP_MARGIN_ANGLE: float = -np.pi / 7
-    _INSERT_TIP_RY_ANGLE: float = np.radians(5)  # slight y-axis tilt during table-top approach and insertion
+    _INSERT_TIP_RY_ANGLE: float = np.radians(4.5)  # slight y-axis tilt during table-top approach and insertion
     _LEG_TIP_OFFSET: float = 0.05625  # distance from leg mesh origin to screw tip (m)
     _LEG_HOLE_OFFSET_X: float = 0.0025  # fine-alignment offset of tip to table hole, X (m)
     _LEG_HOLE_OFFSET_Y: float = 0.001  # fine-alignment offset of tip to table hole, Y (m)
@@ -266,7 +266,7 @@ class Leg(Part):
                     # EE is at insert_ori, descending to insert the leg.
                     leg_z_rel = leg_pose_robot[2, 3] - table_pose_robot[2, 3]
                     leg_tip_z_rel = leg_z_rel - leg_pose_robot[2, 1] * LEG_TIP_OFFSET
-                    if leg_tip_z_rel < 0.05725 - LEG_TIP_OFFSET:  # fully inserted → release the leg
+                    if leg_tip_z_rel < 0.057 - LEG_TIP_OFFSET:  # fully inserted → release the leg
                         return "insert_release"
 
                     # Detect stuck: leg is in the insertion zone but tip XY is off-center from the hole.
