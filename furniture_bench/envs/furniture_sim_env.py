@@ -1662,6 +1662,12 @@ class FurnitureSimEnv(gym.Env):
                 ).to(self.device)
 
             noisy_action = torch.concat([delta_pos, delta_quat, gripper])
+
+            # For states that opt in, record the noisy action as the clean action
+            # so both target noise and action noise are reflected in the dataset.
+            if not self.no_noise and self.furnitures[env_idx].parts[part_idx2].state_clean_action_noise():
+                clean_action = noisy_action
+
             all_noisy.append(noisy_action)
             all_clean.append(clean_action)
             all_skill.append(skill_complete)

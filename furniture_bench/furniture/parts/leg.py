@@ -835,6 +835,11 @@ class Leg(Part):
             "screw",
         ]
 
+    def state_clean_action_noise(self):
+        return self._last_state in [
+            "reach_table_top_z",
+        ]
+
     def _find_closest_y(self, pose):
         closest_y = pose.clone()
         for i in range(4):

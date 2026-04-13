@@ -295,6 +295,10 @@ class Part(ABC):
     def state_low_action_noise(self):
         return False
 
+    def state_clean_action_noise(self):
+        """Return True if the clean_action should also have noise added in this state."""
+        return False
+
     # ---- Backward-compat methods for non-one_leg parts (cabinet, lamp, round_table) ----
 
     def may_transit_state(self, next_state):
