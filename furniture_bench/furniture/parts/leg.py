@@ -16,8 +16,9 @@ class Leg(Part):
     # Ry angle (radians) that pitches the EE toward the floor during the floor pick-up.
     # Adjust here to change the grasp tilt; used identically in compute_state and fsm_step.
     _GRASP_MARGIN_ANGLE: float = -np.pi / 7
+    _INSERT_TIP_RY_ANGLE: float = np.radians(5)  # slight y-axis tilt during table-top approach and insertion
     _LEG_TIP_OFFSET: float = 0.05625  # distance from leg mesh origin to screw tip (m)
-    _LEG_HOLE_OFFSET_X: float = 0.0035  # fine-alignment offset of tip to table hole, X (m)
+    _LEG_HOLE_OFFSET_X: float = 0.0025  # fine-alignment offset of tip to table hole, X (m)
     _LEG_HOLE_OFFSET_Y: float = 0.001  # fine-alignment offset of tip to table hole, Y (m)
     _PICK_X_OFFSET: float = 0.005  # grab 0.5 cm toward the "top" of the leg along X
     _PICK_Z_OFFSET: float = 0.012  # EE hovers 1.2 cm above the leg COM during floor pick
@@ -265,7 +266,7 @@ class Leg(Part):
                     # EE is at insert_ori, descending to insert the leg.
                     leg_z_rel = leg_pose_robot[2, 3] - table_pose_robot[2, 3]
                     leg_tip_z_rel = leg_z_rel - leg_pose_robot[2, 1] * LEG_TIP_OFFSET
-                    if leg_tip_z_rel < 0.0565 - LEG_TIP_OFFSET:  # fully inserted → release the leg
+                    if leg_tip_z_rel < 0.05725 - LEG_TIP_OFFSET:  # fully inserted → release the leg
                         return "insert_release"
 
                     # Detect stuck: leg is in the insertion zone but tip XY is off-center from the hole.
@@ -625,6 +626,14 @@ class Leg(Part):
                 ],
                 device=device,
             )
+            # Rotate orientation only (not position) slightly about world y-axis during insertion approach
+            _c, _s = np.cos(self._INSERT_TIP_RY_ANGLE), np.sin(self._INSERT_TIP_RY_ANGLE)
+            ry3 = torch.tensor(
+                [[_c, 0, _s], [0, 1, 0], [-_s, 0, _c]],
+                dtype=torch.float32,
+                device=device,
+            )
+            target_leg_tip_pose_robot[:3, :3] = ry3 @ target_leg_tip_pose_robot[:3, :3]  # Apply y-axis rotation
             rel = rel_rot_mat(leg_tip_pose_robot, target_leg_tip_pose_robot)
             clean_target = rel @ ee_pose
             clean_target = self._apply_latent_offset(state, clean_target)
@@ -642,6 +651,14 @@ class Leg(Part):
                 ],
                 device=device,
             )
+            # Rotate orientation only (not position) slightly about world y-axis during insertion approach
+            _c, _s = np.cos(self._INSERT_TIP_RY_ANGLE), np.sin(self._INSERT_TIP_RY_ANGLE)
+            ry3 = torch.tensor(
+                [[_c, 0, _s], [0, 1, 0], [-_s, 0, _c]],
+                dtype=torch.float32,
+                device=device,
+            )
+            target_leg_tip_pose_robot[:3, :3] = ry3 @ target_leg_tip_pose_robot[:3, :3]  # Apply y-axis rotation
             rel = rel_rot_mat(leg_tip_pose_robot, target_leg_tip_pose_robot)
             clean_target = rel @ ee_pose
             clean_target = self._apply_latent_offset(state, clean_target)
@@ -836,6 +853,7 @@ class Leg(Part):
         ]
 
     def state_clean_action_noise(self):
+        # Add noise to the recorded actions during leg insertion
         return self._last_state in [
             "reach_table_top_z",
         ]
