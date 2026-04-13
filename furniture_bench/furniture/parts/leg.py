@@ -15,10 +15,13 @@ from furniture_bench.utils.pose import get_mat, is_similar_rot, is_similar_xz, r
 class Leg(Part):
     # Ry angle (radians) that pitches the EE toward the floor during the floor pick-up.
     # Adjust here to change the grasp tilt; used identically in compute_state and fsm_step.
-    _GRASP_MARGIN_ANGLE: float = -np.pi / 9
+    _GRASP_MARGIN_ANGLE: float = -np.pi / 7
     _LEG_TIP_OFFSET: float = 0.05625  # distance from leg mesh origin to screw tip (m)
-    _LEG_HOLE_OFFSET_X: float = 0.004  # fine-alignment of tip to table hole, X (m)
-    _LEG_HOLE_OFFSET_Y: float = 0.001  # fine-alignment of tip to table hole, Y (m)
+    _LEG_HOLE_OFFSET_X: float = 0.0035  # fine-alignment offset of tip to table hole, X (m)
+    _LEG_HOLE_OFFSET_Y: float = 0.001  # fine-alignment offset of tip to table hole, Y (m)
+    _PICK_X_OFFSET: float = 0.005  # grab 0.5 cm toward the "top" of the leg along X
+    _PICK_Z_OFFSET: float = 0.012  # EE hovers 1.2 cm above the leg COM during floor pick
+    _ORI_Z_CLEARANCE: float = 0.05  # extra Z clearance during orientation alignment
 
     def __init__(self, part_config, part_idx):
         super().__init__(part_config, part_idx)
@@ -358,17 +361,23 @@ class Leg(Part):
             leg_xy = leg_pose_robot[:2, 3]
             leg_z = leg_pose_robot[2, 3]
 
-            # Gate on XY proximity between EE and leg.
-            if (ee_pos[:2] - leg_xy).abs().sum() < self.pos_error_threshold * 4:
+            # Offset pick target: 1 cm toward the top of the leg in X, 1.2 cm above leg COM in Z.
+            pick_xy = leg_xy.clone()
+            pick_xy[0] += self._PICK_X_OFFSET
+            pick_z = leg_z + self._PICK_Z_OFFSET
+
+            # Gate on XY proximity between EE and pick target.
+            if (ee_pos[:2] - pick_xy).abs().sum() < self.pos_error_threshold * 3:
                 # Gate on orientation alignment between EE and leg.
+                # Randomized gate to get some grasp angle variation.
                 if (ee_pose[:3, :3] - grasp_ori).abs().sum() < self.ori_error_threshold * 3:
-                    # Gate on Z proximity between EE and leg.
-                    if abs(ee_pos[2] - leg_z) < self.pos_error_threshold * 4:
+                    # Gate on Z proximity between EE and pick target.
+                    if abs(ee_pos[2] - pick_z) < self.pos_error_threshold:
                         return "pick_leg"  # Ready to pick up the leg.
 
-                    return "reach_leg_floor_z"  # EE is at leg XY + grasp_ori but above the leg → descend to leg Z.
+                    return "reach_leg_floor_z"  # EE is at pick XY + grasp_ori but not yet at pick Z → descend.
 
-                return "reach_leg_ori"  # EE is close to leg in XY but not yet aligned with grasp_ori → rotate in place.
+                return "reach_leg_ori"  # EE is close to pick XY but not yet aligned with grasp_ori → rotate in place.
 
             return "reach_leg_floor_xy"
 
@@ -535,12 +544,11 @@ class Leg(Part):
             R_z_delta[1, 0] = s
             R_z_delta[1, 1] = c
             target_ori = R_z_delta @ ee_pose[:3, :3]
+            target_pos[0] + self._PICK_X_OFFSET
             target_pos[2] = ee_pos[2]
-            # target_pos[1] += 0.01
-            target_pos[0] += 0.005
             clean_target = C.to_homogeneous(target_pos, target_ori)
             clean_target = self._apply_latent_offset(state, clean_target)
-            target = self._add_noise(clean_target, pos_std=0.005, ori_std_deg=5.0)
+            target = self._add_noise(clean_target, pos_std=0.007, ori_std_deg=5.0)
             # Large XY motion from neutral to leg (can be 10-15 cm); needs many steps.
             result = self.satisfy(ee_pose, target, pos_error_threshold=0.02, max_len=150)
             if result == "TIMEOUT":
@@ -550,11 +558,11 @@ class Leg(Part):
             target_ori = floor_grasp_ori(leg_pose_down)
             leg_pos_robot = (april_to_robot @ leg_pose_down[:4, 3])[:3]
             target_pos = leg_pos_robot.clone()
-            target_pos[0] = leg_pos_robot[0] + 0.01  # Grab 1cm closer to the "top" of the leg
-            target_pos[2] = leg_pos_robot[2] + 0.05  # High z value -- keep clearance above leg during EE rotation
+            target_pos[0] = leg_pos_robot[0] + self._PICK_X_OFFSET
+            target_pos[2] = leg_pos_robot[2] + self._ORI_Z_CLEARANCE  # keep clearance above leg during EE rotation
             clean_target = C.to_homogeneous(target_pos, target_ori)
             clean_target = self._apply_latent_offset(state, clean_target)
-            target = self._add_noise(clean_target, pos_std=0.004, ori_std_deg=3.0)
+            target = self._add_noise(clean_target, pos_std=0.01, ori_std_deg=5)
             result = self.satisfy(ee_pose, target, pos_error_threshold=0.015, ori_error_threshold=0.1, max_len=150)
             if result == "TIMEOUT":
                 timeout_failure = True
@@ -563,11 +571,11 @@ class Leg(Part):
             target_ori = floor_grasp_ori(leg_pose_down)
             leg_pos_robot = (april_to_robot @ leg_pose_down[:4, 3])[:3]  # leg COM in the robot frame
             target_pos = leg_pos_robot.clone()
-            target_pos[0] = leg_pos_robot[0] + 0.01  # Grab 1cm closer to the "top" of the leg
-            target_pos[2] = leg_pos_robot[2] + 0.012  # Pick 1.2cm above the leg COM
+            target_pos[0] = leg_pos_robot[0] + self._PICK_X_OFFSET
+            target_pos[2] = leg_pos_robot[2] + self._PICK_Z_OFFSET
             clean_target = C.to_homogeneous(target_pos, target_ori)
             clean_target = self._apply_latent_offset(state, clean_target)
-            target = self._add_noise(clean_target, pos_std=0.0005, ori_std_deg=0.5)
+            target = self._add_noise(clean_target, pos_std=0.01, ori_std_deg=15.0)
             result = self.satisfy(ee_pose, target, pos_error_threshold=0.015, ori_error_threshold=0.3, max_len=150)
             if result == "TIMEOUT":
                 timeout_failure = True
@@ -576,11 +584,11 @@ class Leg(Part):
             target_ori = floor_grasp_ori(leg_pose_down)
             leg_pos_robot = (april_to_robot @ leg_pose_down[:4, 3])[:3]  # leg COM in the robot frame
             target_pos = leg_pos_robot.clone()
-            target_pos[0] = leg_pos_robot[0] + 0.01  # Grab 1cm closer to the "top" of the leg
-            target_pos[2] = leg_pos_robot[2] + 0.012  # Pick 1.2cm above the leg COM
+            target_pos[0] = leg_pos_robot[0] + self._PICK_X_OFFSET
+            target_pos[2] = leg_pos_robot[2] + self._PICK_Z_OFFSET
             clean_target = C.to_homogeneous(target_pos, target_ori)
             clean_target = self._apply_latent_offset(state, clean_target)
-            target = self._add_noise(clean_target, pos_std=0.0005, ori_std_deg=0.5)
+            target = self._add_noise(clean_target, pos_std=0.01, ori_std_deg=15.0)
             self.gripper_action = 1
             result = self.gripper_less(gripper_width, 2 * self.half_width + 0.001)
             if result == "TIMEOUT":

@@ -104,7 +104,7 @@ class FurnitureSimEnv(gym.Env):
         super(FurnitureSimEnv, self).__init__()
         self.device = torch.device("cuda", compute_device_id)
 
-        self.scripted_timeout = False
+        self.scripted_timeout = [False] * num_envs
         # Furniture for each environment (reward, reset).
         self.furnitures = [furniture_factory(furniture) for _ in range(num_envs)]
 
@@ -837,9 +837,10 @@ class FurnitureSimEnv(gym.Env):
         self.env_steps += 1
 
         done = self._done()
-        # If scripted policy timed out, force done=True (episode is a failure)
-        if self.scripted_timeout:
-            done = torch.ones_like(done)
+        # If scripted policy timed out for an env, force done=True for that env.
+        for _env_idx in range(self.num_envs):
+            if self.scripted_timeout[_env_idx]:
+                done[_env_idx] = True
 
         return (
             obs,
@@ -1179,7 +1180,7 @@ class FurnitureSimEnv(gym.Env):
             self.refresh()
 
         self.furniture.reset()
-        self.scripted_timeout = False
+        self.scripted_timeout = [False] * self.num_envs
 
         self.refresh()
 
@@ -1222,7 +1223,7 @@ class FurnitureSimEnv(gym.Env):
         if reset_parts:
             self._reset_parts(env_idx)
         self.env_steps[env_idx] = 0
-        self.scripted_timeout = False
+        self.scripted_timeout[env_idx] = False
 
     def reset_env_to(self, env_idx, state):
         """Reset to a specific state. **MUST refresh in between multiple calls
@@ -1244,11 +1245,16 @@ class FurnitureSimEnv(gym.Env):
         self._reset_franka(env_idx, dof_pos)
         self._reset_parts(env_idx, state["parts_poses"])
         self.env_steps[env_idx] = 0
-        self.scripted_timeout = False
+        self.scripted_timeout[env_idx] = False
 
-    def _update_franka_dof_state_buffer(self, dof_pos=None):
+    def _update_franka_dof_state_buffer(self, env_idx=None, dof_pos=None):
         """
-        Sets internal tensor state buffer for Franka actor
+        Sets internal tensor state buffer for Franka actor.
+
+        Args:
+            env_idx: If given, only the row for that environment is updated.
+                     If None (default), all environment rows are updated.
+            dof_pos: DOF positions to write. Falls back to default_dof_pos when None.
         """
         # Low randomness only.
         if self.from_skill >= 1:
@@ -1259,9 +1265,9 @@ class FurnitureSimEnv(gym.Env):
         else:
             dof_pos = self.default_dof_pos if dof_pos is None else dof_pos
 
-        # Views for self.dof_states (used with set_dof_state_tensor* function)
-        self.dof_pos[:, 0 : self.franka_num_dofs] = torch.tensor(dof_pos, device=self.device, dtype=torch.float32)
-        self.dof_vel[:, 0 : self.franka_num_dofs] = torch.tensor(
+        rows = slice(None) if env_idx is None else env_idx
+        self.dof_pos[rows, 0 : self.franka_num_dofs] = torch.tensor(dof_pos, device=self.device, dtype=torch.float32)
+        self.dof_vel[rows, 0 : self.franka_num_dofs] = torch.tensor(
             [0] * len(self.default_dof_pos), device=self.device, dtype=torch.float32
         )
 
@@ -1272,7 +1278,7 @@ class FurnitureSimEnv(gym.Env):
         and set zero torques on frankas across all envs to prevent the reset arms
         from moving while others are still being reset
         """
-        self._update_franka_dof_state_buffer(dof_pos=dof_pos)
+        self._update_franka_dof_state_buffer(env_idx=env_idx, dof_pos=dof_pos)
 
         # Update a single actor
         actor_idx = self.franka_actor_idxs_all_t[env_idx].reshape(1, 1)
@@ -1403,18 +1409,20 @@ class FurnitureSimEnv(gym.Env):
         asset_options.flip_visual_attachments = True
         return self.isaac_gym.load_asset(self.sim, ASSET_ROOT, self.franka_asset_file, asset_options)
 
-    def _detect_assemble_idx(self) -> int:
+    def _detect_assemble_idx(self, env_idx: int = 0) -> int:
         """Markovian: find the first unassembled pair by checking env state."""
         for idx, (i, j) in enumerate(self.furniture.should_be_assembled):
             part1_name = self.furniture.parts[i].name
             part2_name = self.furniture.parts[j].name
+            rb_idx1 = self.part_idxs[part1_name][env_idx]
+            rb_idx2 = self.part_idxs[part2_name][env_idx]
             part1_pose = C.to_homogeneous(
-                self.rb_states[self.part_idxs[part1_name]][0][:3],
-                C.quat2mat(self.rb_states[self.part_idxs[part1_name]][0][3:7]),
+                self.rb_states[rb_idx1][:3],
+                C.quat2mat(self.rb_states[rb_idx1][3:7]),
             )
             part2_pose = C.to_homogeneous(
-                self.rb_states[self.part_idxs[part2_name]][0][:3],
-                C.quat2mat(self.rb_states[self.part_idxs[part2_name]][0][3:7]),
+                self.rb_states[rb_idx2][:3],
+                C.quat2mat(self.rb_states[rb_idx2][3:7]),
             )
             rel_pose = torch.linalg.inv(part1_pose) @ part2_pose
             assembled_rel_poses = self.furniture.assembled_rel_poses[(i, j)]
@@ -1461,179 +1469,204 @@ class FurnitureSimEnv(gym.Env):
         """
         Scripted furniture assembly logic (Markovian: all state inferred from env).
 
+        Supports num_envs >= 1.  Each environment's part FSM is driven independently
+        via self.furnitures[env_idx]; structural furniture properties (should_be_assembled,
+        assembled_rel_poses, assembled()) are read from the shared self.furniture template.
+
         Returns:
-            Tuple (noisy_action, clean_action, skill_complete_mask) where noisy_action
-            is what gets executed in the environment and clean_action is the pure action
-            without any added noise (suitable for recording in a dataset).
+            Tuple (noisy_actions, clean_actions, skill_completes) where:
+                noisy_actions  — (num_envs, 8) tensor executed in the env
+                clean_actions  — (num_envs, 8) tensor recorded in the dataset
+                skill_completes — list of int, one per env (0 or 1)
         """
-        assert self.num_envs == 1  # Only support one environment for now.
         if self.furniture_name not in ["one_leg", "cabinet", "lamp", "round_table"]:
             raise NotImplementedError("[one_leg, cabinet, lamp, round_table] are supported for scripted agent")
 
-        # Read current EE pose, gripper width, and angular velocity
-        ee_pos, ee_quat = self.get_ee_pose()
-        gripper_width = self.gripper_width()
-        ee_pos, ee_quat = ee_pos.squeeze(), ee_quat.squeeze()
-        ee_ang_vel = self.rb_states[self.ee_idxs, 10:13].squeeze()
+        ee_pos_all, ee_quat_all = self.get_ee_pose()  # (num_envs, 3), (num_envs, 4)
+        gripper_width_all = self.gripper_width()  # (num_envs, 1)
+        ee_ang_vel_all = self.rb_states[self.ee_idxs, 10:13]  # (num_envs, 3)
 
-        # Markovian assembly index: scan env state to find first unassembled pair
-        assemble_idx = self._detect_assemble_idx()
-        n_pairs = len(self.furniture.should_be_assembled)
+        all_noisy = []
+        all_clean = []
+        all_skill = []
 
-        print(f"[green][ENV][/green] assemble_idx={assemble_idx}/{n_pairs}, ee_z={ee_pos[2]:.3f}")
-
-        # Move-neutral: after all pairs assembled (or between pairs), lift EE before proceeding to next pair
-        if assemble_idx >= n_pairs:
-            if ee_pos[2] < 0.14:
-                gripper = torch.tensor([-1], dtype=torch.float32, device=self.device)
-                goal_pos = torch.tensor([ee_pos[0], ee_pos[1], 0.15], device=self.device)
-                delta_pos = goal_pos - ee_pos
-                delta_quat = torch.tensor([0, 0, 0, 1], device=self.device)
-                action = torch.concat([delta_pos, delta_quat, gripper])
-                return action.unsqueeze(0), action.unsqueeze(0), 0
-            else:
-                # All assembled and EE is high: done
-                action = torch.tensor([0, 0, 0, 0, 0, 0, 1, -1], dtype=torch.float32, device=self.device).unsqueeze(0)
-                return action, action, 1
-
-        # Get next pair of parts to assemble
-        part_idx1, part_idx2 = self.furniture.should_be_assembled[assemble_idx]
-        part1 = self.furniture.parts[part_idx1]
-        part2 = self.furniture.parts[part_idx2]
-
-        # Check whether to pre-assemble part1 (use cached flag set by pre_assemble() on completion)
-        part1_pre_assemble_done = not hasattr(part1, "compute_pre_assemble_state") or part1.pre_assemble_done
-        part2_pre_assemble_done = not hasattr(part2, "compute_pre_assemble_state") or part2.pre_assemble_done
-
-        timeout_failure = False
-        clean_goal_pos = clean_goal_ori = None
-        if not part1_pre_assemble_done:
-            print(f"[green][ENV][/green] pre-assembling part1={part1.name}")
-            pre_result = part1.pre_assemble(
-                ee_pos,
-                ee_quat,
-                gripper_width,
-                self.rb_states,
-                self.part_idxs,
-                self.sim_to_april_mat,
-                self.april_to_robot_mat,
-            )
-            if len(pre_result) == 7:
-                goal_pos, goal_ori, clean_goal_pos, clean_goal_ori, gripper, skill_complete, timeout_failure = (
-                    pre_result
-                )
-            else:
-                goal_pos, goal_ori, gripper, skill_complete, timeout_failure = pre_result
-                clean_goal_pos, clean_goal_ori = goal_pos, goal_ori
-        elif not part2_pre_assemble_done:
-            print(f"[green][ENV][/green] pre-assembling part2={part2.name}")
-            pre_result = part2.pre_assemble(
-                ee_pos,
-                ee_quat,
-                gripper_width,
-                self.rb_states,
-                self.part_idxs,
-                self.sim_to_april_mat,
-                self.april_to_robot_mat,
-            )
-            if len(pre_result) == 7:
-                goal_pos, goal_ori, clean_goal_pos, clean_goal_ori, gripper, skill_complete, timeout_failure = (
-                    pre_result
-                )
-            else:
-                goal_pos, goal_ori, gripper, skill_complete, timeout_failure = pre_result
-                clean_goal_pos, clean_goal_ori = goal_pos, goal_ori
-        else:
-            print(f"[green][ENV][/green] fsm_step part2={part2.name}, assemble_to={part1.name}")
-            fsm_result = part2.fsm_step(
-                ee_pos,
-                ee_quat,
-                gripper_width,
-                self.rb_states,
-                self.part_idxs,
-                self.sim_to_april_mat,
-                self.april_to_robot_mat,
-                self.furniture.parts[part_idx1].name,
-                ee_ang_vel=ee_ang_vel,
-            )
-            if len(fsm_result) == 7:
-                goal_pos, goal_ori, clean_goal_pos, clean_goal_ori, gripper, skill_complete, timeout_failure = (
-                    fsm_result
-                )
-            else:  # Backward compatibility for older parts that don't return clean goal
-                goal_pos, goal_ori, gripper, skill_complete, timeout_failure = fsm_result
-                clean_goal_pos, clean_goal_ori = goal_pos, goal_ori
-
-        if timeout_failure:
-            print("[green][ENV][/green] scripted_timeout triggered — marking episode as failure")
-            self.scripted_timeout = True
-            zero_action = torch.zeros(8, dtype=torch.float32, device=self.device)
-            zero_action[6] = 1  # qw=1 (identity quaternion)
-            zero_action[7] = -1  # gripper open
-            zero_action = zero_action.unsqueeze(0)
-            return zero_action, zero_action, 0
-
-        # Reduce gains during "screw" so both the recorded actions and the OSC
-        # goal steps are smaller/softer; restore defaults for all other states.
-        if hasattr(part2, "_last_state"):
-            if part2._last_state == "screw":
-                self.delta_pos_gain = 4.0
-                self.delta_quat_gain = 1.0
-                MAX_DELTA_XY = 0.13
-                MAX_DELTA_Z = 0.07
-            elif part2._last_state == "reach_table_top_z":
-                self.delta_pos_gain = 2.5
-                self.delta_quat_gain = 1.0
-                MAX_DELTA_XY = 0.13
-                MAX_DELTA_Z = 0.015
-            else:
-                self.delta_pos_gain = 2.5
-                self.delta_quat_gain = 1.0
-                MAX_DELTA_XY = 0.13
-                MAX_DELTA_Z = 0.07
-
-        # Compute noisy delta position from (noisy) goal
         identity_quat = torch.tensor([0.0, 0.0, 0.0, 1.0], device=self.device)
-        delta_pos = self._compute_delta_pos(
-            goal_pos, ee_pos, max_delta_xy=MAX_DELTA_XY, max_delta_z=MAX_DELTA_Z, noisy=True
-        )
-        delta_quat = C.quat_mul(C.quat_conjugate(ee_quat), goal_ori)
-        delta_quat = C.quat_slerp(identity_quat, delta_quat, self.delta_quat_gain)
 
-        # Compute clean delta position from clean goal (deterministic — no random kick or clamp noise)
-        clean_delta_pos = self._compute_delta_pos(
-            clean_goal_pos, ee_pos, max_delta_xy=MAX_DELTA_XY, max_delta_z=MAX_DELTA_Z, noisy=False
-        )
-        clean_delta_quat = C.quat_mul(C.quat_conjugate(ee_quat), clean_goal_ori)
-        clean_delta_quat = C.quat_slerp(identity_quat, clean_delta_quat, self.delta_quat_gain)
+        for env_idx in range(self.num_envs):
+            ee_pos = ee_pos_all[env_idx]  # (3,)
+            ee_quat = ee_quat_all[env_idx]  # (4,)
+            gripper_width = gripper_width_all[env_idx]  # (1,)
+            ee_ang_vel = ee_ang_vel_all[env_idx]  # (3,)
 
-        clean_action = torch.concat([clean_delta_pos, clean_delta_quat, gripper])
+            # Build a single-env view of part_idxs so the part FSMs (which use [0])
+            # correctly address this env's rigid-body state indices.
+            env_part_idxs = {name: [idxs[env_idx]] for name, idxs in self.part_idxs.items()}
 
-        # Randomly add noise to the executed action (not recorded).
-        # Low-action-noise states get half the standard deviation and hard clips.
-        if not self.no_noise and not self.furniture.parts[part_idx2].state_no_noise():
-            low_noise = self.furniture.parts[part_idx2].state_low_action_noise()
-            action_noise_scale = 0.5 if low_noise else 1.0
-            pos_noise = torch.normal(torch.zeros_like(delta_pos), 0.005 * action_noise_scale)
-            if low_noise:
-                pos_clip = 0.005
-                pos_noise = pos_noise.clamp(-pos_clip, pos_clip)
-            delta_pos = delta_pos + pos_noise
-            aa_noise = [
-                np.radians(np.random.normal(0, 5 * action_noise_scale)),
-                np.radians(np.random.normal(0, 5 * action_noise_scale)),
-                np.radians(np.random.normal(0, 5 * action_noise_scale)),
-            ]
-            if low_noise:
-                aa_clip = np.radians(4.0)
-                aa_noise = [np.clip(v, -aa_clip, aa_clip) for v in aa_noise]
-            delta_quat = C.quat_multiply(
-                delta_quat,
-                torch.tensor(T.axisangle2quat(aa_noise), device=self.device),
-            ).to(self.device)
+            assemble_idx = self._detect_assemble_idx(env_idx)
+            n_pairs = len(self.furniture.should_be_assembled)
 
-        noisy_action = torch.concat([delta_pos, delta_quat, gripper])
-        return noisy_action.unsqueeze(0), clean_action.unsqueeze(0), skill_complete
+            print(f"[green][ENV {env_idx}][/green] assemble_idx={assemble_idx}/{n_pairs}, ee_z={ee_pos[2]:.3f}")
+
+            # Move-neutral: after all pairs assembled (or between pairs), lift EE before proceeding to next pair
+            if assemble_idx >= n_pairs:
+                if ee_pos[2] < 0.14:
+                    gripper = torch.tensor([-1], dtype=torch.float32, device=self.device)
+                    goal_pos = torch.tensor([ee_pos[0], ee_pos[1], 0.15], device=self.device)
+                    delta_pos = goal_pos - ee_pos
+                    delta_quat = torch.tensor([0, 0, 0, 1], device=self.device)
+                    action = torch.concat([delta_pos, delta_quat, gripper])
+                    all_noisy.append(action)
+                    all_clean.append(action)
+                    all_skill.append(0)
+                else:
+                    action = torch.tensor([0, 0, 0, 0, 0, 0, 1, -1], dtype=torch.float32, device=self.device)
+                    all_noisy.append(action)
+                    all_clean.append(action)
+                    all_skill.append(1)
+                continue
+
+            # Get next pair of parts to assemble
+            part_idx1, part_idx2 = self.furniture.should_be_assembled[assemble_idx]
+            # Use per-env furniture FSM objects so each env has independent state.
+            part1 = self.furnitures[env_idx].parts[part_idx1]
+            part2 = self.furnitures[env_idx].parts[part_idx2]
+
+            # Check whether to pre-assemble part1 (use cached flag set by pre_assemble() on completion)
+            part1_pre_assemble_done = not hasattr(part1, "compute_pre_assemble_state") or part1.pre_assemble_done
+            part2_pre_assemble_done = not hasattr(part2, "compute_pre_assemble_state") or part2.pre_assemble_done
+
+            timeout_failure = False
+            clean_goal_pos = clean_goal_ori = None
+            if not part1_pre_assemble_done:
+                print(f"[green][ENV {env_idx}][/green] pre-assembling part1={part1.name}")
+                pre_result = part1.pre_assemble(
+                    ee_pos,
+                    ee_quat,
+                    gripper_width,
+                    self.rb_states,
+                    env_part_idxs,
+                    self.sim_to_april_mat,
+                    self.april_to_robot_mat,
+                )
+                if len(pre_result) == 7:
+                    goal_pos, goal_ori, clean_goal_pos, clean_goal_ori, gripper, skill_complete, timeout_failure = (
+                        pre_result
+                    )
+                else:  # Backward compatibility for older parts that don't return clean goal
+                    goal_pos, goal_ori, gripper, skill_complete, timeout_failure = pre_result
+                    clean_goal_pos, clean_goal_ori = goal_pos, goal_ori
+            elif not part2_pre_assemble_done:
+                print(f"[green][ENV {env_idx}][/green] pre-assembling part2={part2.name}")
+                pre_result = part2.pre_assemble(
+                    ee_pos,
+                    ee_quat,
+                    gripper_width,
+                    self.rb_states,
+                    env_part_idxs,
+                    self.sim_to_april_mat,
+                    self.april_to_robot_mat,
+                )
+                if len(pre_result) == 7:
+                    goal_pos, goal_ori, clean_goal_pos, clean_goal_ori, gripper, skill_complete, timeout_failure = (
+                        pre_result
+                    )
+                else:  # Backward compatibility for older parts that don't return clean goal
+                    goal_pos, goal_ori, gripper, skill_complete, timeout_failure = pre_result
+                    clean_goal_pos, clean_goal_ori = goal_pos, goal_ori
+            else:
+                print(f"[green][ENV {env_idx}][/green] fsm_step part2={part2.name}, assemble_to={part1.name}")
+                fsm_result = part2.fsm_step(
+                    ee_pos,
+                    ee_quat,
+                    gripper_width,
+                    self.rb_states,
+                    env_part_idxs,
+                    self.sim_to_april_mat,
+                    self.april_to_robot_mat,
+                    self.furnitures[env_idx].parts[part_idx1].name,
+                    ee_ang_vel=ee_ang_vel,
+                )
+                if len(fsm_result) == 7:
+                    goal_pos, goal_ori, clean_goal_pos, clean_goal_ori, gripper, skill_complete, timeout_failure = (
+                        fsm_result
+                    )
+                else:  # Backward compatibility for older parts that don't return clean goal
+                    goal_pos, goal_ori, gripper, skill_complete, timeout_failure = fsm_result
+                    clean_goal_pos, clean_goal_ori = goal_pos, goal_ori
+
+            if timeout_failure:
+                print(f"[green][ENV {env_idx}][/green] scripted_timeout triggered — marking episode as failure")
+                self.scripted_timeout[env_idx] = True
+                zero_action = torch.zeros(8, dtype=torch.float32, device=self.device)
+                zero_action[6] = 1  # qw=1 (identity quaternion)
+                zero_action[7] = -1  # gripper open
+                all_noisy.append(zero_action)
+                all_clean.append(zero_action)
+                all_skill.append(0)
+                continue
+
+            # Per-env gains (set before _compute_delta_pos which reads self.delta_pos_gain).
+            self.delta_pos_gain = 2.5
+            self.delta_quat_gain = 1.0
+            MAX_DELTA_XY = 0.13
+            MAX_DELTA_Z = 0.07
+            if hasattr(part2, "_last_state"):
+                if part2._last_state == "screw":
+                    self.delta_pos_gain = 4.0
+                    self.delta_quat_gain = 1.0
+                    MAX_DELTA_XY = 0.13
+                    MAX_DELTA_Z = 0.07
+                elif part2._last_state == "reach_table_top_z":
+                    self.delta_pos_gain = 2.5
+                    self.delta_quat_gain = 1.0
+                    MAX_DELTA_XY = 0.13
+                    MAX_DELTA_Z = 0.015
+
+            # Compute noisy delta position from (noisy) goal
+            delta_pos = self._compute_delta_pos(
+                goal_pos, ee_pos, max_delta_xy=MAX_DELTA_XY, max_delta_z=MAX_DELTA_Z, noisy=True
+            )
+            delta_quat = C.quat_mul(C.quat_conjugate(ee_quat), goal_ori)
+            delta_quat = C.quat_slerp(identity_quat, delta_quat, self.delta_quat_gain)
+
+            # Compute clean delta position from clean goal (deterministic — no random kick or clamp noise)
+            clean_delta_pos = self._compute_delta_pos(
+                clean_goal_pos, ee_pos, max_delta_xy=MAX_DELTA_XY, max_delta_z=MAX_DELTA_Z, noisy=False
+            )
+            clean_delta_quat = C.quat_mul(C.quat_conjugate(ee_quat), clean_goal_ori)
+            clean_delta_quat = C.quat_slerp(identity_quat, clean_delta_quat, self.delta_quat_gain)
+
+            clean_action = torch.concat([clean_delta_pos, clean_delta_quat, gripper])
+
+            # Randomly add noise to the executed action (not recorded).
+            # Low-action-noise states get half the standard deviation and hard clips.
+            if not self.no_noise and not self.furnitures[env_idx].parts[part_idx2].state_no_noise():
+                low_noise = self.furnitures[env_idx].parts[part_idx2].state_low_action_noise()
+                action_noise_scale = 0.5 if low_noise else 1.0
+                pos_noise = torch.normal(torch.zeros_like(delta_pos), 0.005 * action_noise_scale)
+                if low_noise:
+                    pos_clip = 0.005
+                    pos_noise = pos_noise.clamp(-pos_clip, pos_clip)
+                delta_pos = delta_pos + pos_noise
+                aa_noise = [
+                    np.radians(np.random.normal(0, 5 * action_noise_scale)),
+                    np.radians(np.random.normal(0, 5 * action_noise_scale)),
+                    np.radians(np.random.normal(0, 5 * action_noise_scale)),
+                ]
+                if low_noise:
+                    aa_clip = np.radians(4.0)
+                    aa_noise = [np.clip(v, -aa_clip, aa_clip) for v in aa_noise]
+                delta_quat = C.quat_multiply(
+                    delta_quat,
+                    torch.tensor(T.axisangle2quat(aa_noise), device=self.device),
+                ).to(self.device)
+
+            noisy_action = torch.concat([delta_pos, delta_quat, gripper])
+            all_noisy.append(noisy_action)
+            all_clean.append(clean_action)
+            all_skill.append(skill_complete)
+
+        return torch.stack(all_noisy), torch.stack(all_clean), all_skill
 
     def assembly_success(self):
         return self._done().squeeze()
