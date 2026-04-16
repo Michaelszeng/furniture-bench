@@ -1695,29 +1695,28 @@ class FurnitureSimEnv(gym.Env):
             if not self.no_noise and not self.furnitures[env_idx].parts[part_idx2].state_no_noise():
                 low_noise = self.furnitures[env_idx].parts[part_idx2].state_low_action_noise()
                 action_noise_scale = 0.5 if low_noise else 1.0
-                # pos_noise = torch.normal(torch.zeros_like(delta_pos), 0.005 * action_noise_scale)
-                # if low_noise:
-                #     pos_clip = 0.005
-                #     pos_noise = pos_noise.clamp(-pos_clip, pos_clip)
-                # delta_pos = delta_pos + pos_noise
-                # aa_noise = [
-                #     np.radians(np.random.normal(0, 5 * action_noise_scale)),
-                #     np.radians(np.random.normal(0, 5 * action_noise_scale)),
-                #     np.radians(np.random.normal(0, 5 * action_noise_scale)),
-                # ]
-                # if low_noise:
-                #     aa_clip = np.radians(4.0)
-                #     aa_noise = [np.clip(v, -aa_clip, aa_clip) for v in aa_noise]
-                # delta_quat = C.quat_multiply(
-                #     delta_quat,
-                #     torch.tensor(T.axisangle2quat(aa_noise), device=self.device),
-                # ).to(self.device)
+                pos_noise = torch.normal(torch.zeros_like(delta_pos), 0.005 * action_noise_scale)
+                if low_noise:
+                    pos_clip = 0.005
+                    pos_noise = pos_noise.clamp(-pos_clip, pos_clip)
+                delta_pos = delta_pos + pos_noise
+                aa_noise = [
+                    np.radians(np.random.normal(0, 5 * action_noise_scale)),
+                    np.radians(np.random.normal(0, 5 * action_noise_scale)),
+                    np.radians(np.random.normal(0, 5 * action_noise_scale)),
+                ]
+                if low_noise:
+                    aa_clip = np.radians(4.0)
+                    aa_noise = [np.clip(v, -aa_clip, aa_clip) for v in aa_noise]
+                delta_quat = C.quat_multiply(
+                    delta_quat,
+                    torch.tensor(T.axisangle2quat(aa_noise), device=self.device),
+                ).to(self.device)
 
+                # if self.furnitures[env_idx].parts[part_idx2].state_no_noise():
                 # Temporally correlated (OU) noise, added on top of the i.i.d. noise above.
                 # Update rule (variance-preserving): z_t = alpha·z_{t-1} + √(1-alpha²)·ε_t
                 # alpha=0 → pure i.i.d.; alpha→1 → slow drift with time constant τ = 1/(1-alpha) steps.
-
-            if self.furnitures[env_idx].parts[part_idx2].state_no_noise():
                 if self.non_markovian and Leg._NM_CORR_ACTION_NOISE:  # TODO: make non Leg-specific
                     alpha = self.corr_noise_alpha
                     scale = np.sqrt(1.0 - alpha**2)
