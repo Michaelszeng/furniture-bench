@@ -40,6 +40,7 @@ from furniture_bench.envs.observation import (
 
 # from furniture_bench.controllers.diffik_qp import diffik_factory
 from furniture_bench.furniture import furniture_factory
+from furniture_bench.furniture.parts.leg import Leg
 from furniture_bench.furniture.parts.part import Part
 from furniture_bench.robot.robot_state import ROBOT_STATE_DIMS
 from furniture_bench.sim_config import sim_config
@@ -76,6 +77,8 @@ class FurnitureSimEnv(gym.Env):
         ctrl_mode: str = "osc",
         ee_laser: bool = False,
         no_noise: bool = False,
+        corr_noise_alpha: float = 0.8,
+        non_markovian: bool = False,
         **kwargs,
     ):
         """
@@ -155,6 +158,13 @@ class FurnitureSimEnv(gym.Env):
         self.ctrl_mode = ctrl_mode
         self.ee_laser = ee_laser
         self.no_noise = no_noise
+        self.corr_noise_alpha = corr_noise_alpha
+        self.non_markovian = non_markovian
+        self._corr_noise_state = {}  # (env_idx, part_idx) -> {'pos': Tensor(3), 'aa': ndarray(3)}
+        # Per-env Non-Markovian pause state (used by get_assembly_action)
+        self._nm_pause_remaining = [0] * num_envs  # steps left in current pause
+        self._nm_prev_state_key = [None] * num_envs  # (assemble_idx, part_name, fsm_state) of last FSM call
+        self._nm_pause_gripper = [-1.0] * num_envs  # gripper command to hold during pause
         if no_noise:
             for furn in self.furnitures:
                 for part in furn.parts:
@@ -1181,6 +1191,10 @@ class FurnitureSimEnv(gym.Env):
 
         self.furniture.reset()
         self.scripted_timeout = [False] * self.num_envs
+        self._corr_noise_state = {}
+        self._nm_pause_remaining = [0] * self.num_envs
+        self._nm_prev_state_key = [None] * self.num_envs
+        self._nm_pause_gripper = [-1.0] * self.num_envs
 
         self.refresh()
 
@@ -1224,6 +1238,10 @@ class FurnitureSimEnv(gym.Env):
             self._reset_parts(env_idx)
         self.env_steps[env_idx] = 0
         self.scripted_timeout[env_idx] = False
+        # Clear NM pause state for this env so it doesn't carry over between episodes.
+        self._nm_pause_remaining[env_idx] = 0
+        self._nm_prev_state_key[env_idx] = None
+        self._nm_pause_gripper[env_idx] = -1.0
 
     def reset_env_to(self, env_idx, state):
         """Reset to a specific state. **MUST refresh in between multiple calls
@@ -1535,6 +1553,18 @@ class FurnitureSimEnv(gym.Env):
             part1_pre_assemble_done = not hasattr(part1, "compute_pre_assemble_state") or part1.pre_assemble_done
             part2_pre_assemble_done = not hasattr(part2, "compute_pre_assemble_state") or part2.pre_assemble_done
 
+            # ── Non-Markovian pause: hold still without calling the FSM ──────────────
+            if self.non_markovian and Leg._NM_PAUSES and self._nm_pause_remaining[env_idx] > 0:
+                self._nm_pause_remaining[env_idx] -= 1
+                hold = torch.zeros(8, dtype=torch.float32, device=self.device)
+                hold[6] = 1.0  # qw=1 (identity quaternion, same layout as timeout zero_action)
+                hold[7] = self._nm_pause_gripper[env_idx]
+                all_noisy.append(hold)
+                all_clean.append(hold)
+                all_skill.append(0)
+                continue
+            # ─────────────────────────────────────────────────────────────────────────
+
             timeout_failure = False
             clean_goal_pos = clean_goal_ori = None
             if not part1_pre_assemble_done:
@@ -1605,6 +1635,19 @@ class FurnitureSimEnv(gym.Env):
                 all_skill.append(0)
                 continue
 
+            # ── Non-Markovian pause: detect state transition, arm pause for next step ─
+            if self.non_markovian and Leg._NM_PAUSES:
+                active_part = part1 if not part1_pre_assemble_done else part2
+                new_key = (assemble_idx, active_part.name, getattr(active_part, "_last_state", None))
+                if new_key != self._nm_prev_state_key[env_idx]:
+                    self._nm_prev_state_key[env_idx] = new_key
+                    excluded = getattr(active_part, "_NM_PAUSE_EXCLUDED_STATES", frozenset())
+                    if active_part._last_state not in excluded:
+                        pause_max = getattr(active_part, "_NM_MAX_PAUSE", Leg._NM_MAX_PAUSE)
+                        self._nm_pause_remaining[env_idx] = int(np.random.randint(0, pause_max + 1))
+                        self._nm_pause_gripper[env_idx] = float(gripper[0].item())
+            # ─────────────────────────────────────────────────────────────────────────
+
             # Per-env gains (set before _compute_delta_pos which reads self.delta_pos_gain).
             self.delta_pos_gain = 2.5
             self.delta_quat_gain = 1.0
@@ -1643,23 +1686,50 @@ class FurnitureSimEnv(gym.Env):
             if not self.no_noise and not self.furnitures[env_idx].parts[part_idx2].state_no_noise():
                 low_noise = self.furnitures[env_idx].parts[part_idx2].state_low_action_noise()
                 action_noise_scale = 0.5 if low_noise else 1.0
-                pos_noise = torch.normal(torch.zeros_like(delta_pos), 0.005 * action_noise_scale)
-                if low_noise:
-                    pos_clip = 0.005
-                    pos_noise = pos_noise.clamp(-pos_clip, pos_clip)
-                delta_pos = delta_pos + pos_noise
-                aa_noise = [
-                    np.radians(np.random.normal(0, 5 * action_noise_scale)),
-                    np.radians(np.random.normal(0, 5 * action_noise_scale)),
-                    np.radians(np.random.normal(0, 5 * action_noise_scale)),
-                ]
-                if low_noise:
-                    aa_clip = np.radians(4.0)
-                    aa_noise = [np.clip(v, -aa_clip, aa_clip) for v in aa_noise]
-                delta_quat = C.quat_multiply(
-                    delta_quat,
-                    torch.tensor(T.axisangle2quat(aa_noise), device=self.device),
-                ).to(self.device)
+                # pos_noise = torch.normal(torch.zeros_like(delta_pos), 0.005 * action_noise_scale)
+                # if low_noise:
+                #     pos_clip = 0.005
+                #     pos_noise = pos_noise.clamp(-pos_clip, pos_clip)
+                # delta_pos = delta_pos + pos_noise
+                # aa_noise = [
+                #     np.radians(np.random.normal(0, 5 * action_noise_scale)),
+                #     np.radians(np.random.normal(0, 5 * action_noise_scale)),
+                #     np.radians(np.random.normal(0, 5 * action_noise_scale)),
+                # ]
+                # if low_noise:
+                #     aa_clip = np.radians(4.0)
+                #     aa_noise = [np.clip(v, -aa_clip, aa_clip) for v in aa_noise]
+                # delta_quat = C.quat_multiply(
+                #     delta_quat,
+                #     torch.tensor(T.axisangle2quat(aa_noise), device=self.device),
+                # ).to(self.device)
+
+                # Temporally correlated (OU) noise, added on top of the i.i.d. noise above.
+                # Update rule (variance-preserving): z_t = alpha·z_{t-1} + √(1-alpha²)·ε_t
+                # alpha=0 → pure i.i.d.; alpha→1 → slow drift with time constant τ = 1/(1-alpha) steps.
+
+            if self.furnitures[env_idx].parts[part_idx2].state_no_noise():
+                if self.non_markovian and Leg._NM_CORR_ACTION_NOISE:  # TODO: make non Leg-specific
+                    alpha = self.corr_noise_alpha
+                    scale = np.sqrt(1.0 - alpha**2)
+                    key = (env_idx, part_idx2)
+                    if key not in self._corr_noise_state:
+                        self._corr_noise_state[key] = {
+                            "pos": torch.zeros(3, device=self.device),
+                            "aa": np.zeros(3),
+                        }
+                    cs = self._corr_noise_state[key]
+                    # Position
+                    pos_std = 0.005 * action_noise_scale
+                    cs["pos"] = alpha * cs["pos"] + scale * torch.normal(torch.zeros(3, device=self.device), pos_std)
+                    delta_pos = delta_pos + cs["pos"]
+                    # Orientation
+                    aa_std = np.radians(5 * action_noise_scale)
+                    cs["aa"] = alpha * cs["aa"] + scale * np.random.normal(0, aa_std, size=(3,))
+                    delta_quat = C.quat_multiply(
+                        delta_quat,
+                        torch.tensor(T.axisangle2quat(cs["aa"].tolist()), device=self.device),
+                    ).to(self.device)
 
             noisy_action = torch.concat([delta_pos, delta_quat, gripper])
 

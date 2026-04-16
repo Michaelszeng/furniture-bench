@@ -201,7 +201,7 @@ class Part(ABC):
         if pos_err < pos_error_threshold and ori_err < ori_error_threshold:
             return True
         elapsed = self.curr_cnt - self.prev_cnt
-        if elapsed >= max_len:
+        if elapsed >= max_len * self.max_len_multiplier + self.max_len_offset:
             print(
                 f"[TIMEOUT] {self.name} satisfy after {elapsed} steps (pos_err={pos_err.item():.4f}, ori_err={ori_err.item():.4f})"
             )
@@ -285,6 +285,8 @@ class Part(ABC):
         self.gripper_action = -1
         self.prev_cnt = 0
         self.curr_cnt = 0
+        self.max_len_multiplier = 1  # multiplied into every satisfy() max_len; set to 2 for non-Markovian
+        self.max_len_offset = 0      # added to every satisfy() max_len after multiplication
         # Backward-compat reset for non-Markovian parts
         self.first_setting_target = True
         self.target = None

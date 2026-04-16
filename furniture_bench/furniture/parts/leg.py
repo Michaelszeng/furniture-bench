@@ -13,6 +13,17 @@ from furniture_bench.utils.pose import get_mat, is_similar_rot, is_similar_xz, r
 
 
 class Leg(Part):
+    # ── Non-Markovian feature toggles (active only when --non-markovian is set) ──
+    _NM_LATENT_PLAN: bool = False  # episode-level fixed position offsets per state
+    _NM_PAUSES: bool = True  # random-length hold at each state transition
+    _NM_STEP_NOISE: bool = False  # per-step probabilistic target-noise switching
+    _NM_CORR_ACTION_NOISE: bool = False  # temporally-correlated OU action noise (set in data_collector.py)
+
+    _NM_MAX_PAUSE: int = 10  # max pause duration (steps); also added to every satisfy() timeout budget
+
+    # States where no pause is injected even when _NM_PAUSES is True.
+    _NM_PAUSE_EXCLUDED_STATES: frozenset = frozenset({"release", "lift_up", "reach_leg_floor_xy"})
+
     # Ry angle (radians) that pitches the EE toward the floor during the floor pick-up.
     # Adjust here to change the grasp tilt; used identically in compute_state and fsm_step.
     _GRASP_MARGIN_ANGLE: float = -np.pi / 7
@@ -40,7 +51,7 @@ class Leg(Part):
         self.skill_complete_next_states = [
             "lift_up",
             "pre_screw",
-        ]  # Specificy next state after skill is complete. Screw done is handle in `get_assembly_action`
+        ]  # Specify next state after a skill is complete. Screw done is handled in `get_assembly_action`
 
         self.reset()
 
@@ -53,15 +64,13 @@ class Leg(Part):
         self.prev_leg_tip_z_rel = float("inf")
         self.prev_leg_z_vel_robot = float("inf")
         self.gripper_action = -1
-        self.screw_mode = "standard"  # latent variable: "standard" or "alternate" (-90° Z offset)
         self.latent_offsets = {}  # per-state 3D position offsets, empty = no latent plan
-        self.pause_durations = {}  # per-state pause steps sampled at episode start
-        self._pause_remaining = 0  # steps left in the current pause
+        self.step_noise_stds = {}  # per-state std for shifting step noise
+        self.step_noise_switch_prob = 0.0  # per-step probability of resampling step noise
+        self._step_noise = {}  # per-state current step noise vector
 
     def apply_non_markovian_config(self):
         """Sample episode-level non-Markovian latent variables."""
-        self.screw_mode = random.choice(["standard", "alternate"])
-
         # States that require positional precision get small offsets; all others get large offsets.
         LOW_STD_STATES = {"reach_table_top_z", "pre_screw"}
         ZERO_STD_STATES = {"screw_grasp", "screw", "insert_release", "reach_leg_floor_z"}
@@ -84,29 +93,53 @@ class Leg(Part):
             "screw_grasp",
             "screw",
         ]
-        self.latent_offsets = {
-            state: np.random.normal(
-                0, 0 if state in ZERO_STD_STATES else LOW_STD if state in LOW_STD_STATES else HIGH_STD, size=(3,)
-            )
-            for state in all_states
-        }
+        if self._NM_LATENT_PLAN:
+            self.latent_offsets = {
+                state: np.random.normal(
+                    0, 0 if state in ZERO_STD_STATES else LOW_STD if state in LOW_STD_STATES else HIGH_STD, size=(3,)
+                )
+                for state in all_states
+            }
 
-        # Sample a pause duration (in steps) for each state: Uniform[0, 1 second] @ 10 Hz.
-        pause_max = config["robot"]["hz"]  # = 10 steps per second
-        self.pause_durations = {state: np.random.randint(0, pause_max + 1) for state in all_states}
+        if self._NM_STEP_NOISE:
+            # Per-step shifting noise: same std tiers as the latent plan.
+            # At each step, a new noise vector is sampled with probability switch_prob,
+            # replacing the current one; otherwise the existing vector persists.
+            # switch_prob = 0.1 → geometric mean persistence of 10 steps (~1 second).
+            self.step_noise_switch_prob = 0.1
+            self.step_noise_stds = {
+                state: 0.0 if state in ZERO_STD_STATES else LOW_STD if state in LOW_STD_STATES else HIGH_STD
+                for state in all_states
+            }
+            self._step_noise = {}  # vectors will be lazily sampled on first encounter
 
     def _apply_latent_offset(self, state: str, clean_target):
+        """Apply non-Markovian position offsets to clean_target[:3, 3]:
+        1. Episode-level latent plan offset (fixed for the episode).
+        2. Per-step shifting noise (resampled probabilistically each step).
+        Both are additive; either is a no-op when its config dict is empty.
         """
-        Add the episode-level latent position offset to clean_target[:3, 3].
-        If self.latent_offsets is not set, no-op.
-        """
-        if not self.latent_offsets:
-            return clean_target
-        offset = self.latent_offsets.get(state)
-        if offset is None:
-            return clean_target
-        clean_target = clean_target.clone()
-        clean_target[:3, 3] += torch.tensor(offset, device=clean_target.device, dtype=clean_target.dtype)
+        cloned = False
+
+        # 1. Episode-level latent plan offset (sampled once in apply_non_markovian_config)
+        if self.latent_offsets:
+            offset = self.latent_offsets.get(state)
+            if offset is not None:
+                clean_target = clean_target.clone()
+                cloned = True
+                clean_target[:3, 3] += torch.tensor(offset, device=clean_target.device, dtype=clean_target.dtype)
+
+        # 2. Per-step shifting noise
+        if self.step_noise_stds:
+            std = self.step_noise_stds.get(state, 0.0)
+            # Resample with probability switch_prob; initialise lazily on first encounter.
+            if state not in self._step_noise or np.random.random() < self.step_noise_switch_prob:
+                self._step_noise[state] = np.random.normal(0, std, size=(3,))
+            step_offset = self._step_noise[state]
+            if not cloned:
+                clean_target = clean_target.clone()
+            clean_target[:3, 3] += torch.tensor(step_offset, device=clean_target.device, dtype=clean_target.dtype)
+
         return clean_target
 
     def is_in_reset_ori(self, pose: npt.NDArray[np.float32], from_skill, ori_bound) -> bool:
@@ -231,15 +264,10 @@ class Leg(Part):
         _rot_sim_to_robot = (april_to_robot @ sim_to_april_mat)[:3, :3]
         leg_z_vel_robot = (_rot_sim_to_robot @ _leg_vel_sim)[2]
 
-        # Hard-coded INSERTED-phase orientations (mode-dependent).
-        # Standard:  pre_screw = Rx(π)@Rz(π),   screw_done = Rx(π)           (−180° around Z)
-        # Alternate: pre_screw = Rx(π)@Rz(π/2), screw_done = Rx(π)@Rz(−π/2) (same arc, −90° offset)
-        if self.screw_mode == "alternate":
-            pre_screw_ori = C.rot_mat_tensor(np.pi, 0, np.pi / 2, device)[:3, :3]
-            screw_ori = C.rot_mat_tensor(np.pi, 0, -np.pi / 2, device)[:3, :3]
-        else:
-            pre_screw_ori = C.rot_mat_tensor(np.pi, 0, np.pi, device)[:3, :3]
-            screw_ori = C.rot_mat_tensor(np.pi, 0, 0, device)[:3, :3]
+        # Hard-coded INSERTED-phase orientations.
+        # pre_screw = Rx(π)@Rz(π),  screw_done = Rx(π)  (−180° around Z)
+        pre_screw_ori = C.rot_mat_tensor(np.pi, 0, np.pi, device)[:3, :3]
+        screw_ori = C.rot_mat_tensor(np.pi, 0, 0, device)[:3, :3]
 
         # Stable pre-screw position: table hole XY + insert_z height.
         # Using the stable table reference (not the bouncing leg) avoids the EE chasing
@@ -446,37 +474,6 @@ class Leg(Part):
         timeout_failure = False
 
         ee_pose = C.to_homogeneous(ee_pos, C.quat2mat(ee_quat))
-
-        # ── Non-Markovian pause injection ─────────────────────────────────────────
-        if self.pause_durations:
-            # On the first step of each new state, arm the pause counter once.
-            if state != self._last_state and self._pause_remaining == 0:
-                self._pause_remaining = self.pause_durations.get(state, 0)
-
-            if self._pause_remaining > 0:
-                # Hold current EE pose (with per-step noise) for the duration of the pause.
-                # Do NOT call state_transition_handler so curr_cnt stays frozen, preserving
-                # the full timeout budget for the actual action phase that follows.
-                device = ee_pose.device
-                clean_target = ee_pose.clone()
-                target = self._add_noise(clean_target)
-                # skill_complete fires only on the very first step of the new state.
-                skill_complete = 1 if (state != self._last_state and state in self.skill_complete_next_states) else 0
-                self._last_state = state  # mark state seen without advancing curr_cnt
-                self._pause_remaining -= 1
-                if self._pause_remaining == 0:
-                    # Pause just expired: reset timeout budget so action phase runs in full.
-                    self.prev_cnt = self.curr_cnt
-                return (
-                    target[:3, 3],
-                    C.mat2quat(target[:3, :3]),
-                    clean_target[:3, 3],
-                    C.mat2quat(clean_target[:3, :3]),
-                    torch.tensor([self.gripper_action], device=device),
-                    skill_complete,
-                    False,
-                )
-        # ── end pause injection ────────────────────────────────────────────────────
 
         table_pose = C.to_homogeneous(
             rb_states[part_idxs[assemble_to]][0][:3],
@@ -730,18 +727,8 @@ class Leg(Part):
             if ee_z_dot_down < 0.9975:
                 # Phase 1: right the gripper vertically
                 target_ori = C.rot_mat_tensor(np.pi, 0, 0, device)[:3, :3]
-            elif self.screw_mode == "alternate":
-                ee_x_dot_world_y = ee_pose[1, 0]
-                if ee_x_dot_world_y < 0.2:
-                    # Phase 2a: rotate to Rz(30°) first.
-                    print("phase 2a")
-                    target_ori = C.rot_mat_tensor(np.pi, 0, np.pi / 4, device)[:3, :3]
-                else:
-                    # Phase 2b: final 90° CCW to Rx(π)@Rz(π/2).
-                    print("phase 2b")
-                    target_ori = C.rot_mat_tensor(np.pi, 0, np.pi / 2, device)[:3, :3]
-            else:  # standard
-                # Standard mode: 180° rotation split into two 90° phases to avoid ambiguity.
+            else:
+                # 180° rotation split into two 90° phases to avoid ambiguity.
                 if ee_x_dot_world_x > 0.25:
                     # Phase 2a: first 90° CCW about world-Z.
                     print("phase 2a")
@@ -762,10 +749,7 @@ class Leg(Part):
             target_pos = (april_to_robot @ leg_pose)[:3, 3].clone()
             # target_pos[2] = table_pose_robot[2, 3] + 0.065
             target_pos[2] = 0.055
-            if self.screw_mode == "alternate":
-                target_ori = C.rot_mat_tensor(np.pi, 0, np.pi / 2, device)[:3, :3]
-            else:  # standard
-                target_ori = C.rot_mat_tensor(np.pi, 0, np.pi, device)[:3, :3]
+            target_ori = C.rot_mat_tensor(np.pi, 0, np.pi, device)[:3, :3]
             clean_target = C.to_homogeneous(target_pos, target_ori)
             clean_target = self._apply_latent_offset(state, clean_target)
             target = self._add_noise(clean_target, pos_std=0.0, ori_std_deg=0.0)
@@ -791,28 +775,17 @@ class Leg(Part):
                 dtype=ee_pos.dtype,
             )
 
-            if self.screw_mode == "alternate":
-                ee_x_dot_world_y = ee_pose[1, 0]
-                if ee_x_dot_world_y > 0.75:
-                    # Phase a: first 90° CW (Rz: π/2 → 0).
-                    print("phase 2a")
-                    target_ori = C.rot_mat_tensor(np.pi, 0, 0, device)[:3, :3]
-                else:
-                    # Phase b: second 90° CW (Rz: 0 → −π/2).
-                    print("phase 2b")
-                    target_ori = C.rot_mat_tensor(np.pi, 0, -np.pi / 2 - 0.1, device)[:3, :3]
-            else:  # standard
-                # At pre_screw_ori (Rz(π)@Rx(π)): ee_x_dot_world_x = -1.
-                # At intermediate    (Rz(π/2)@Rx(π)): ee_x_dot_world_x =  0.
-                # At final target    (Rx(π)):          ee_x_dot_world_x = +1.
-                if ee_x_dot_world_x < -0.25:
-                    # Phase 2a: first 90° CW (Rz: π → π/2).
-                    print("phase 2a")
-                    target_ori = C.rot_mat_tensor(np.pi, 0, np.pi / 2, device)[:3, :3]
-                else:
-                    # Phase 2b: final 90° CW (Rz: π/2 → 0) to screw target.
-                    print("phase 2b")
-                    target_ori = C.rot_mat_tensor(np.pi, 0, 0 - 0.1, device)[:3, :3]
+            # At pre_screw_ori (Rz(π)@Rx(π)): ee_x_dot_world_x = -1.
+            # At intermediate    (Rz(π/2)@Rx(π)): ee_x_dot_world_x =  0.
+            # At final target    (Rx(π)):          ee_x_dot_world_x = +1.
+            if ee_x_dot_world_x < -0.25:
+                # Phase 2a: first 90° CW (Rz: π → π/2).
+                print("phase 2a")
+                target_ori = C.rot_mat_tensor(np.pi, 0, np.pi / 2, device)[:3, :3]
+            else:
+                # Phase 2b: final 90° CW (Rz: π/2 → 0) to screw target.
+                print("phase 2b")
+                target_ori = C.rot_mat_tensor(np.pi, 0, 0 - 0.1, device)[:3, :3]
 
             # Intentially tilt a little bit into the corner of the obstacle to avoid the table_top sliding
             TILT_ANGLE = 3
