@@ -46,6 +46,7 @@ class Part(ABC):
         self.part_moved_skill_idx = part_config.get("part_moved_skill_idx", np.inf)
         self.part_attached_skill_idx = part_config.get("part_attached_skill_idx", np.inf)
         self.no_noise = False
+        self.dart_amount = 1.0
 
     def randomize_init_pose(self, from_skill=0, pos_range=[-0.05, 0.05], rot_range=45):
         self.reset_pos[from_skill][:2] = self.part_config["reset_pos"][from_skill][:2] + np.random.uniform(
@@ -258,15 +259,18 @@ class Part(ABC):
         if self.no_noise or self.state_no_noise():
             return target
         noisy = target.clone()
-        std = torch.tensor([pos_std, pos_std, pos_std_z if pos_std_z is not None else pos_std], dtype=torch.float32)
+        scaled_pos_std = pos_std * self.dart_amount
+        scaled_pos_std_z = (pos_std_z if pos_std_z is not None else pos_std) * self.dart_amount
+        std = torch.tensor([scaled_pos_std, scaled_pos_std, scaled_pos_std_z], dtype=torch.float32)
         pos_noise = torch.normal(mean=torch.zeros(3), std=std)
         if pos_max is not None:
             pos_noise = pos_noise.clamp(-pos_max, pos_max)
         noisy[:3, 3] += pos_noise.to(target.device)
+        scaled_ori_std_deg = ori_std_deg * self.dart_amount
         ori_noise = [
-            np.radians(np.random.normal(0, ori_std_deg)),
-            np.radians(np.random.normal(0, ori_std_deg)),
-            np.radians(np.random.normal(0, ori_std_deg)),
+            np.radians(np.random.normal(0, scaled_ori_std_deg)),
+            np.radians(np.random.normal(0, scaled_ori_std_deg)),
+            np.radians(np.random.normal(0, scaled_ori_std_deg)),
         ]
         if ori_max_deg is not None:
             ori_max_rad = np.radians(ori_max_deg)
