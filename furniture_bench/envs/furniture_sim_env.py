@@ -1695,15 +1695,15 @@ class FurnitureSimEnv(gym.Env):
             if not self.no_noise and not self.furnitures[env_idx].parts[part_idx2].state_no_noise():
                 low_noise = self.furnitures[env_idx].parts[part_idx2].state_low_action_noise()
                 action_noise_scale = 0.5 if low_noise else 1.0
-                pos_noise = torch.normal(torch.zeros_like(delta_pos), 0.005 * action_noise_scale)
+                pos_noise = torch.normal(torch.zeros_like(delta_pos), 0.005 * action_noise_scale * self.dart_amount)
                 if low_noise:
-                    pos_clip = 0.005
+                    pos_clip = 0.005 * self.dart_amount
                     pos_noise = pos_noise.clamp(-pos_clip, pos_clip)
                 delta_pos = delta_pos + pos_noise
                 aa_noise = [
-                    np.radians(np.random.normal(0, 5 * action_noise_scale)),
-                    np.radians(np.random.normal(0, 5 * action_noise_scale)),
-                    np.radians(np.random.normal(0, 5 * action_noise_scale)),
+                    np.radians(np.random.normal(0, 5 * action_noise_scale * self.dart_amount)),
+                    np.radians(np.random.normal(0, 5 * action_noise_scale * self.dart_amount)),
+                    np.radians(np.random.normal(0, 5 * action_noise_scale * self.dart_amount)),
                 ]
                 if low_noise:
                     aa_clip = np.radians(4.0)
@@ -1728,11 +1728,11 @@ class FurnitureSimEnv(gym.Env):
                         }
                     cs = self._corr_noise_state[key]
                     # Position
-                    pos_std = 0.005 * action_noise_scale
+                    pos_std = 0.005 * action_noise_scale * self.dart_amount
                     cs["pos"] = alpha * cs["pos"] + scale * torch.normal(torch.zeros(3, device=self.device), pos_std)
                     delta_pos = delta_pos + cs["pos"]
                     # Orientation
-                    aa_std = np.radians(5 * action_noise_scale)
+                    aa_std = np.radians(5 * action_noise_scale * self.dart_amount)
                     cs["aa"] = alpha * cs["aa"] + scale * np.random.normal(0, aa_std, size=(3,))
                     delta_quat = C.quat_multiply(
                         delta_quat,
