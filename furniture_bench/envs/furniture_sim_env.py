@@ -79,6 +79,7 @@ class FurnitureSimEnv(gym.Env):
         no_noise: bool = False,
         corr_noise_alpha: float = 0.8,
         non_markovian: bool = False,
+        dart_amount: float = 1.0,
         **kwargs,
     ):
         """
@@ -165,6 +166,7 @@ class FurnitureSimEnv(gym.Env):
         self._nm_pause_remaining = [0] * num_envs  # steps left in current pause
         self._nm_prev_state_key = [None] * num_envs  # (assemble_idx, part_name, fsm_state) of last FSM call
         self._nm_pause_gripper = [-1.0] * num_envs  # gripper command to hold during pause
+        self.dart_amount = dart_amount
         if no_noise:
             for furn in self.furnitures:
                 for part in furn.parts:
@@ -172,6 +174,13 @@ class FurnitureSimEnv(gym.Env):
             if self.furniture not in self.furnitures:
                 for part in self.furniture.parts:
                     part.no_noise = True
+        if dart_amount != 1.0:
+            for furn in self.furnitures:
+                for part in furn.parts:
+                    part.dart_amount = dart_amount
+            if self.furniture not in self.furnitures:
+                for part in self.furniture.parts:
+                    part.dart_amount = dart_amount
 
         self._create_ground_plane()
         self._setup_lights()
@@ -1523,7 +1532,7 @@ class FurnitureSimEnv(gym.Env):
             assemble_idx = self._detect_assemble_idx(env_idx)
             n_pairs = len(self.furniture.should_be_assembled)
 
-            print(f"[green][ENV {env_idx}][/green] assemble_idx={assemble_idx}/{n_pairs}, ee_z={ee_pos[2]:.3f}")
+            # print(f"[green][ENV {env_idx}][/green] assemble_idx={assemble_idx}/{n_pairs}, ee_z={ee_pos[2]:.3f}")
 
             # Move-neutral: after all pairs assembled (or between pairs), lift EE before proceeding to next pair
             if assemble_idx >= n_pairs:
@@ -1568,7 +1577,7 @@ class FurnitureSimEnv(gym.Env):
             timeout_failure = False
             clean_goal_pos = clean_goal_ori = None
             if not part1_pre_assemble_done:
-                print(f"[green][ENV {env_idx}][/green] pre-assembling part1={part1.name}")
+                # print(f"[green][ENV {env_idx}][/green] pre-assembling part1={part1.name}")
                 pre_result = part1.pre_assemble(
                     ee_pos,
                     ee_quat,
@@ -1586,7 +1595,7 @@ class FurnitureSimEnv(gym.Env):
                     goal_pos, goal_ori, gripper, skill_complete, timeout_failure = pre_result
                     clean_goal_pos, clean_goal_ori = goal_pos, goal_ori
             elif not part2_pre_assemble_done:
-                print(f"[green][ENV {env_idx}][/green] pre-assembling part2={part2.name}")
+                # print(f"[green][ENV {env_idx}][/green] pre-assembling part2={part2.name}")
                 pre_result = part2.pre_assemble(
                     ee_pos,
                     ee_quat,
@@ -1604,7 +1613,7 @@ class FurnitureSimEnv(gym.Env):
                     goal_pos, goal_ori, gripper, skill_complete, timeout_failure = pre_result
                     clean_goal_pos, clean_goal_ori = goal_pos, goal_ori
             else:
-                print(f"[green][ENV {env_idx}][/green] fsm_step part2={part2.name}, assemble_to={part1.name}")
+                # print(f"[green][ENV {env_idx}][/green] fsm_step part2={part2.name}, assemble_to={part1.name}")
                 fsm_result = part2.fsm_step(
                     ee_pos,
                     ee_quat,
