@@ -48,6 +48,20 @@ from furniture_bench.utils.pose import get_mat, rot_mat
 
 ASSET_ROOT = str(Path(__file__).parent.parent.absolute() / "assets")
 
+# ---------------------------------------------------------------------------
+# Noise enable/disable flags for scripted policy
+# (for testing — override runtime no_noise flag)
+# ---------------------------------------------------------------------------
+# Target noise: (1) FSM per-step goal-pose jitter via _add_noise() [main jitter source];
+#               (2) randomised kick multiplier and XY speed limit in _compute_delta_pos.
+_ENABLE_TARGET_NOISE: bool = False
+# Action noise: i.i.d. Gaussian on delta_pos and orientation
+_ENABLE_ACTION_NOISE: bool = False
+# Temporally correlated (OU) action noise (non-Markovian only); independent of i.i.d. noise
+_ENABLE_CORR_ACTION_NOISE: bool = True
+# OU smoothing factor: τ = 1/(1-alpha) steps.  0.97 → τ≈33 steps (~3 s at 10 Hz).
+_CORR_NOISE_ALPHA: float = 0.95
+
 
 class FurnitureSimEnv(gym.Env):
     """FurnitureSim base class."""
@@ -167,7 +181,7 @@ class FurnitureSimEnv(gym.Env):
         self._nm_prev_state_key = [None] * num_envs  # (assemble_idx, part_name, fsm_state) of last FSM call
         self._nm_pause_gripper = [-1.0] * num_envs  # gripper command to hold during pause
         self.dart_amount = dart_amount
-        if no_noise:
+        if no_noise or not _ENABLE_TARGET_NOISE:
             for furn in self.furnitures:
                 for part in furn.parts:
                     part.no_noise = True
@@ -1676,7 +1690,11 @@ class FurnitureSimEnv(gym.Env):
 
             # Compute noisy delta position from (noisy) goal
             delta_pos = self._compute_delta_pos(
-                goal_pos, ee_pos, max_delta_xy=MAX_DELTA_XY, max_delta_z=MAX_DELTA_Z, noisy=True
+                goal_pos,
+                ee_pos,
+                max_delta_xy=MAX_DELTA_XY,
+                max_delta_z=MAX_DELTA_Z,
+                noisy=_ENABLE_TARGET_NOISE and not self.no_noise,
             )
             delta_quat = C.quat_mul(C.quat_conjugate(ee_quat), goal_ori)
             delta_quat = C.quat_slerp(identity_quat, delta_quat, self.delta_quat_gain)
@@ -1690,22 +1708,25 @@ class FurnitureSimEnv(gym.Env):
 
             clean_action = torch.concat([clean_delta_pos, clean_delta_quat, gripper])
 
-            # Randomly add noise to the executed action (not recorded).
+            # Noise scale shared by both i.i.d. and corr noise blocks.
+            _state_no_noise = self.furnitures[env_idx].parts[part_idx2].state_no_noise()
+            _low_noise = self.furnitures[env_idx].parts[part_idx2].state_low_action_noise()
+            _action_noise_scale = 0.5 if _low_noise else 1.0
+
+            # Randomly add i.i.d. noise to the executed action (not recorded).
             # Low-action-noise states get half the standard deviation and hard clips.
-            if not self.no_noise and not self.furnitures[env_idx].parts[part_idx2].state_no_noise():
-                low_noise = self.furnitures[env_idx].parts[part_idx2].state_low_action_noise()
-                action_noise_scale = 0.5 if low_noise else 1.0
-                pos_noise = torch.normal(torch.zeros_like(delta_pos), 0.005 * action_noise_scale * self.dart_amount)
-                if low_noise:
+            if _ENABLE_ACTION_NOISE and not self.no_noise and not _state_no_noise:
+                pos_noise = torch.normal(torch.zeros_like(delta_pos), 0.005 * _action_noise_scale * self.dart_amount)
+                if _low_noise:
                     pos_clip = 0.005 * self.dart_amount
                     pos_noise = pos_noise.clamp(-pos_clip, pos_clip)
                 delta_pos = delta_pos + pos_noise
                 aa_noise = [
-                    np.radians(np.random.normal(0, 5 * action_noise_scale * self.dart_amount)),
-                    np.radians(np.random.normal(0, 5 * action_noise_scale * self.dart_amount)),
-                    np.radians(np.random.normal(0, 5 * action_noise_scale * self.dart_amount)),
+                    np.radians(np.random.normal(0, 5 * _action_noise_scale * self.dart_amount)),
+                    np.radians(np.random.normal(0, 5 * _action_noise_scale * self.dart_amount)),
+                    np.radians(np.random.normal(0, 5 * _action_noise_scale * self.dart_amount)),
                 ]
-                if low_noise:
+                if _low_noise:
                     aa_clip = np.radians(4.0)
                     aa_noise = [np.clip(v, -aa_clip, aa_clip) for v in aa_noise]
                 delta_quat = C.quat_multiply(
@@ -1713,37 +1734,38 @@ class FurnitureSimEnv(gym.Env):
                     torch.tensor(T.axisangle2quat(aa_noise), device=self.device),
                 ).to(self.device)
 
-                # if self.furnitures[env_idx].parts[part_idx2].state_no_noise():
-                # Temporally correlated (OU) noise, added on top of the i.i.d. noise above.
-                # Update rule (variance-preserving): z_t = alpha·z_{t-1} + √(1-alpha²)·ε_t
-                # alpha=0 → pure i.i.d.; alpha→1 → slow drift with time constant τ = 1/(1-alpha) steps.
-                if self.non_markovian and Leg._NM_CORR_ACTION_NOISE:  # TODO: make non Leg-specific
-                    alpha = self.corr_noise_alpha
-                    scale = np.sqrt(1.0 - alpha**2)
-                    key = (env_idx, part_idx2)
-                    if key not in self._corr_noise_state:
-                        self._corr_noise_state[key] = {
-                            "pos": torch.zeros(3, device=self.device),
-                            "aa": np.zeros(3),
-                        }
-                    cs = self._corr_noise_state[key]
-                    # Position
-                    pos_std = 0.005 * action_noise_scale * self.dart_amount
-                    cs["pos"] = alpha * cs["pos"] + scale * torch.normal(torch.zeros(3, device=self.device), pos_std)
-                    delta_pos = delta_pos + cs["pos"]
-                    # Orientation
-                    aa_std = np.radians(5 * action_noise_scale * self.dart_amount)
-                    cs["aa"] = alpha * cs["aa"] + scale * np.random.normal(0, aa_std, size=(3,))
-                    delta_quat = C.quat_multiply(
-                        delta_quat,
-                        torch.tensor(T.axisangle2quat(cs["aa"].tolist()), device=self.device),
-                    ).to(self.device)
+            # Temporally correlated (OU) noise — independent of i.i.d. noise above.
+            # Update rule (variance-preserving): z_t = alpha·z_{t-1} + √(1-alpha²)·ε_t
+            # alpha=0 → pure i.i.d.; alpha→1 → slow drift with τ = 1/(1-alpha) steps.
+            if _ENABLE_CORR_ACTION_NOISE and not self.no_noise and not _state_no_noise and self.non_markovian:
+                alpha = _CORR_NOISE_ALPHA
+                scale = np.sqrt(1.0 - alpha**2)
+                key = (env_idx, part_idx2)
+                if key not in self._corr_noise_state:
+                    self._corr_noise_state[key] = {
+                        "pos": torch.zeros(3, device=self.device),
+                        "aa": np.zeros(3),
+                    }
+                cs = self._corr_noise_state[key]
+                pos_std = 0.005 * _action_noise_scale * self.dart_amount
+                cs["pos"] = alpha * cs["pos"] + scale * torch.normal(torch.zeros(3, device=self.device), pos_std)
+                delta_pos = delta_pos + cs["pos"]
+                aa_std = np.radians(5 * _action_noise_scale * self.dart_amount)
+                cs["aa"] = alpha * cs["aa"] + scale * np.random.normal(0, aa_std, size=(3,))
+                delta_quat = C.quat_multiply(
+                    delta_quat,
+                    torch.tensor(T.axisangle2quat(cs["aa"].tolist()), device=self.device),
+                ).to(self.device)
 
             noisy_action = torch.concat([delta_pos, delta_quat, gripper])
 
             # For states that opt in, record the noisy action as the clean action
             # so both target noise and action noise are reflected in the dataset.
-            if not self.no_noise and self.furnitures[env_idx].parts[part_idx2].state_clean_action_noise():
+            if (
+                _ENABLE_ACTION_NOISE
+                and not self.no_noise
+                and self.furnitures[env_idx].parts[part_idx2].state_clean_action_noise()
+            ):
                 clean_action = noisy_action
 
             all_noisy.append(noisy_action)

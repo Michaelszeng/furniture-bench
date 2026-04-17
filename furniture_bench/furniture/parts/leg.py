@@ -17,7 +17,6 @@ class Leg(Part):
     _NM_LATENT_PLAN: bool = False  # episode-level fixed position offsets per state
     _NM_PAUSES: bool = True  # random-length hold at each state transition
     _NM_STEP_NOISE: bool = False  # per-step probabilistic target-noise switching
-    _NM_CORR_ACTION_NOISE: bool = False  # temporally-correlated OU action noise (set in data_collector.py)
 
     _NM_MAX_PAUSE: int = 10  # max pause duration (steps); also added to every satisfy() timeout budget
 
