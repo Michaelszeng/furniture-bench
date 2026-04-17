@@ -202,7 +202,7 @@ class Part(ABC):
         if pos_err < pos_error_threshold and ori_err < ori_error_threshold:
             return True
         elapsed = self.curr_cnt - self.prev_cnt
-        if elapsed >= max_len * self.max_len_multiplier + self.max_len_offset:
+        if elapsed >= max_len + self.max_len_offset:
             print(
                 f"[TIMEOUT] {self.name} satisfy after {elapsed} steps (pos_err={pos_err.item():.4f}, ori_err={ori_err.item():.4f})"
             )
@@ -289,8 +289,7 @@ class Part(ABC):
         self.gripper_action = -1
         self.prev_cnt = 0
         self.curr_cnt = 0
-        self.max_len_multiplier = 1  # multiplied into every satisfy() max_len; set to 2 for non-Markovian
-        self.max_len_offset = 0      # added to every satisfy() max_len after multiplication
+        self.max_len_offset = 0  # extra steps added to every satisfy() budget; set to _NM_MAX_PAUSE for non-Markovian
         # Backward-compat reset for non-Markovian parts
         self.first_setting_target = True
         self.target = None
@@ -321,7 +320,12 @@ class Part(ABC):
         return skill_complete
 
     def add_noise_first_target(self, target, pos_noise=None, ori_noise=None):
-        """Legacy per-state-entry noise. Kept for cabinet/lamp/round_table parts."""
+        """
+        Legacy per-state-entry noise. Kept for cabinet/lamp/round_table parts.
+        Adds a fixed noise to the target pose on the first time entering a state (rather than adding random target
+        noise each timestep).
+        TODO: REMOVE THIS.
+        """
         if self.no_noise or self.state_no_noise():
             return target
         if self.first_setting_target:
