@@ -561,7 +561,7 @@ class Leg(Part):
             clean_target = C.to_homogeneous(target_pos, target_ori)
             clean_target = self._apply_latent_offset(state, clean_target)
             target = self._add_noise(clean_target, pos_std=0.01, ori_std_deg=5)
-            result = self.satisfy(ee_pose, target, pos_error_threshold=0.015, ori_error_threshold=0.1, max_len=150)
+            result = self.satisfy(ee_pose, target, pos_error_threshold=0.015, ori_error_threshold=0.1, max_len=60)
             if result == "TIMEOUT":
                 timeout_failure = True
         elif state == "reach_leg_floor_z":
@@ -574,7 +574,7 @@ class Leg(Part):
             clean_target = C.to_homogeneous(target_pos, target_ori)
             clean_target = self._apply_latent_offset(state, clean_target)
             target = self._add_noise(clean_target, pos_std=0.01, ori_std_deg=15.0)
-            result = self.satisfy(ee_pose, target, pos_error_threshold=0.015, ori_error_threshold=0.3, max_len=150)
+            result = self.satisfy(ee_pose, target, pos_error_threshold=0.015, ori_error_threshold=0.3, max_len=30)
             if result == "TIMEOUT":
                 timeout_failure = True
         elif state == "pick_leg":
@@ -741,7 +741,7 @@ class Leg(Part):
             clean_target = C.to_homogeneous(target_pos, target_ori)
             clean_target = self._apply_latent_offset(state, clean_target)
             target = self._add_noise(clean_target, pos_std=0.0, ori_std_deg=0.0)
-            result = self.satisfy(ee_pose, target, max_len=300)
+            result = self.satisfy(ee_pose, target, max_len=90)
             if result == "TIMEOUT":
                 timeout_failure = True
         elif state == "screw_grasp":
