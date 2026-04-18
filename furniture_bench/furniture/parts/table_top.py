@@ -12,6 +12,14 @@ from furniture_bench.utils.pose import get_mat, is_similar_rot, rot_mat
 
 
 class TableTop(Part):
+    # ── Per-state noise tiers ──────────────────────────────────────────────────
+    # Target-noise tiers (used by apply_non_markovian_config for latent offsets / step noise stds).
+    # Target-noise tiers (used by apply_non_markovian_config for latent offsets / step noise stds).
+    # NOTE: these do not affect the random per-step target noise in _add_noise_to_target(), only affect the latent
+    # plan offsets and step noise stds.
+    _LOW_TARGET_STD_STATES: frozenset = frozenset({"reach_body_grasp_z", "push", "pick_body", "release", "done"})
+    _ZERO_TARGET_STD_STATES: frozenset = frozenset({})
+
     def __init__(self, part_config: dict, part_idx: int):
         super().__init__(part_config, part_idx)
 
@@ -31,6 +39,36 @@ class TableTop(Part):
         self._last_state = "reach_body_grasp_xy"
         self.gripper_action = -1
         self._grasp_side_offset_robot = None  # set once grasp target is first computed
+
+    def apply_non_markovian_config(self):
+        """Sample episode-level non-Markovian latent variables for table-top pre-assembly."""
+        if not self._NM_LATENT_PLAN:
+            return
+
+        HIGH_STD = 0.020
+        LOW_STD = 0.003
+
+        all_states = [
+            "reach_body_grasp_xy",
+            "reach_body_grasp_z",
+            "pick_body",
+            "push",
+            "release",
+            "go_up",
+            "done",
+        ]
+        self.latent_offsets = {
+            state: np.random.normal(
+                0,
+                0.0
+                if state in self._ZERO_TARGET_STD_STATES
+                else LOW_STD
+                if state in self._LOW_TARGET_STD_STATES
+                else HIGH_STD,
+                size=(3,),
+            )
+            for state in all_states
+        }
 
     def is_in_reset_ori(self, pose, from_skill, ori_bound):
         reset_ori = self.reset_ori[from_skill] if len(self.reset_ori) > 1 else self.reset_ori[0]
@@ -205,7 +243,11 @@ class TableTop(Part):
 
         if state == "reach_body_grasp_xy":
             clean_target = self._get_grasp_target(body_pose_april, april_to_robot, ee_pos, device)
-            target = self._add_noise(clean_target)
+            clean_target = self._apply_latent_offset(state, clean_target)
+            if self.non_markovian:
+                target = self._add_noise_to_target(clean_target, step_noise_pos_std=0.020, step_noise_ori_std_deg=5.0)
+            else:
+                target = self._add_noise_to_target(clean_target)
             result = self.satisfy(ee_pose, target, max_len=300)
             if result == "TIMEOUT":
                 timeout_failure = True
@@ -217,10 +259,19 @@ class TableTop(Part):
             target_ori = grasp_target[:3, :3]
 
             clean_target = C.to_homogeneous(target_pos, target_ori)
-            target = self._add_noise(
-                clean_target,
-                pos_std=0.005,  # slightly larger noise for Z approach (original: [0.01, 0.01, 0.001])
-            )
+            clean_target = self._apply_latent_offset(state, clean_target)
+            if self.non_markovian:
+                target = self._add_noise_to_target(
+                    clean_target,
+                    pos_std=0.005,  # slightly larger noise for Z approach (original: [0.01, 0.01, 0.001])
+                    step_noise_pos_std=0.006,
+                    step_noise_ori_std_deg=3.0,
+                )
+            else:
+                target = self._add_noise_to_target(
+                    clean_target,
+                    pos_std=0.005,  # slightly larger noise for Z approach (original: [0.01, 0.01, 0.001])
+                )
             result = self.satisfy(ee_pose, target, max_len=150)
             if result == "TIMEOUT":
                 timeout_failure = True
@@ -231,7 +282,13 @@ class TableTop(Part):
             target_pos[2] = body_pose_robot[2, 3]
             target_ori = grasp_target[:3, :3]
             clean_target = C.to_homogeneous(target_pos, target_ori)
-            target = self._add_noise(clean_target, pos_std=0.003, ori_std_deg=3.0)
+            clean_target = self._apply_latent_offset(state, clean_target)
+            if self.non_markovian:
+                target = self._add_noise_to_target(
+                    clean_target, pos_std=0.003, ori_std_deg=3.0, step_noise_pos_std=0.003, step_noise_ori_std_deg=3.0
+                )
+            else:
+                target = self._add_noise_to_target(clean_target, pos_std=0.003, ori_std_deg=3.0)
             self.gripper_action = 1
             result = self.gripper_less(gripper_width, self.body_grip_width)
             if result == "TIMEOUT":
@@ -241,7 +298,18 @@ class TableTop(Part):
             clean_target = self._get_push_target(
                 rb_states, part_idxs, sim_to_april_mat, april_to_robot, ee_pose, device, body_pose_robot
             )
-            target = self._add_noise(clean_target, pos_std=0.001)
+            clean_target = self._apply_latent_offset(state, clean_target)
+            if self.non_markovian:
+                target = self._add_noise_to_target(
+                    clean_target,
+                    pos_std=0.001,
+                    step_noise_pos_std=0.008,
+                    step_noise_ori_std_deg=1.0,
+                    pos_max=0.08,
+                    ori_max_deg=1.0,
+                )
+            else:
+                target = self._add_noise_to_target(clean_target, pos_std=0.001)
             result = self.satisfy(ee_pose, target, pos_error_threshold=0.02, ori_error_threshold=0.5, max_len=300)
             if result == "TIMEOUT":
                 timeout_failure = True
@@ -250,7 +318,13 @@ class TableTop(Part):
             clean_target = self._get_push_target(
                 rb_states, part_idxs, sim_to_april_mat, april_to_robot, ee_pose, device, body_pose_robot
             )
-            target = self._add_noise(clean_target, pos_std=0.003, ori_std_deg=3.0)
+            clean_target = self._apply_latent_offset(state, clean_target)
+            if self.non_markovian:
+                target = self._add_noise_to_target(
+                    clean_target, pos_std=0.003, ori_std_deg=3.0, step_noise_pos_std=0.003, step_noise_ori_std_deg=3.0
+                )
+            else:
+                target = self._add_noise_to_target(clean_target, pos_std=0.003, ori_std_deg=3.0)
             self.gripper_action = -1
             result = self.gripper_greater(
                 gripper_width,
@@ -267,7 +341,11 @@ class TableTop(Part):
             target_pos[2] = 0.1
             target_ori = push_target[:3, :3]
             clean_target = C.to_homogeneous(target_pos, target_ori)
-            target = self._add_noise(clean_target)
+            clean_target = self._apply_latent_offset(state, clean_target)
+            if self.non_markovian:
+                target = self._add_noise_to_target(clean_target, step_noise_pos_std=0.01, step_noise_ori_std_deg=6.0)
+            else:
+                target = self._add_noise_to_target(clean_target)
             result = self.satisfy(ee_pose, target, max_len=150)
             if result == "TIMEOUT":
                 timeout_failure = True
@@ -281,7 +359,13 @@ class TableTop(Part):
             target_pos[2] = 0.1
             target_ori = push_target[:3, :3]
             clean_target = C.to_homogeneous(target_pos, target_ori)
-            target = self._add_noise(clean_target, pos_std=0.003, ori_std_deg=3.0)
+            clean_target = self._apply_latent_offset(state, clean_target)
+            if self.non_markovian:
+                target = self._add_noise_to_target(
+                    clean_target, pos_std=0.003, ori_std_deg=3.0, step_noise_pos_std=0.003, step_noise_ori_std_deg=3.0
+                )
+            else:
+                target = self._add_noise_to_target(clean_target, pos_std=0.003, ori_std_deg=3.0)
             self.gripper_action = -1
 
         skill_complete = self.state_transition_handler(self._last_state, state)

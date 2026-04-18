@@ -301,7 +301,7 @@ class LampBulb(Leg):
             skill_complete,
         )
 
-    def state_no_noise(self):
+    def current_state_no_noise(self):
         return self._state in [
             # 'screw_grasp', 'screw', 'match_leg_ori', 'reach_table_top_xy', 'reach_table_top_z'
             "insert_wait",

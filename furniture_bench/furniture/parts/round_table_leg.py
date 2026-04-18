@@ -298,7 +298,7 @@ class RoundTableLeg(Leg):
             skill_complete,
         )
 
-    def state_no_noise(self):
+    def current_state_no_noise(self):
         return self._state in [
             "insert_wait",
             "insert_release",

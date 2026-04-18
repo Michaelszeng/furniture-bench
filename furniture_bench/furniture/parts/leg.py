@@ -14,14 +14,19 @@ from furniture_bench.utils.pose import get_mat, is_similar_rot, is_similar_xz, r
 
 class Leg(Part):
     # ── Non-Markovian feature toggles (active only when --non-markovian is set) ──
-    _NM_LATENT_PLAN: bool = False  # episode-level fixed position offsets per state
-    _NM_PAUSES: bool = True  # random-length hold at each state transition
-    _NM_STEP_NOISE: bool = False  # per-step probabilistic target-noise switching
+    _NM_PAUSE_EXCLUDED_STATES: frozenset = frozenset({"release", "lift_up", "reach_leg_floor_xy", "reach_leg_floor_z"})
 
-    _NM_MAX_PAUSE: int = 10  # max pause duration (steps); also added to every satisfy() timeout budget
-
-    # States where no pause is injected even when _NM_PAUSES is True.
-    _NM_PAUSE_EXCLUDED_STATES: frozenset = frozenset({"release", "lift_up", "reach_leg_floor_xy"})
+    # ── Per-state noise tiers ──────────────────────────────────────────────────
+    # Target-noise tiers (used by apply_non_markovian_config for latent offsets / step noise stds).
+    # NOTE: these do not affect the random per-step target noise in _add_noise_to_target(), only affect the latent
+    # plan offsets and step noise stds.
+    _LOW_TARGET_STD_STATES: frozenset = frozenset({"reach_leg_floor_z", "pick_leg", "reach_table_top_xy", "pre_screw"})
+    _ZERO_TARGET_STD_STATES: frozenset = frozenset({"screw_grasp", "screw", "insert_release", "reach_table_top_z"})
+    # Action-noise tiers (used by furniture_sim_env when computing the executed action).
+    _LOW_ACTION_NOISE_STATES: frozenset = frozenset({"reach_table_top_z", "pre_screw", "screw_grasp", "screw"})
+    _NO_ACTION_NOISE_STATES: frozenset = frozenset({"insert_release"})
+    # States where the noisy (executed) action is also recorded as the clean action.
+    _CLEAN_ACTION_NOISE_STATES: frozenset = frozenset({"reach_table_top_z"})
 
     # Ry angle (radians) that pitches the EE toward the floor during the floor pick-up.
     # Adjust here to change the grasp tilt; used identically in compute_state and fsm_step.
@@ -57,22 +62,18 @@ class Leg(Part):
         self.part_attached_skill_idx = 4
 
     def reset(self):
-        super().reset()  # resets prev_cnt=0, curr_cnt=0, pre_assemble_done, etc.
+        super().reset()  # resets prev_cnt=0, curr_cnt=0, pre_assemble_done, latent_offsets, step_noise_*, etc.
         self._last_state = "reach_leg_floor_xy"
         self.GOT_STUCK = False
         self.prev_leg_tip_z_rel = float("inf")
         self.prev_leg_z_vel_robot = float("inf")
         self.gripper_action = -1
-        self.latent_offsets = {}  # per-state 3D position offsets, empty = no latent plan
-        self.step_noise_stds = {}  # per-state std for shifting step noise
-        self.step_noise_switch_prob = 0.0  # per-step probability of resampling step noise
-        self._step_noise = {}  # per-state current step noise vector
 
     def apply_non_markovian_config(self):
         """Sample episode-level non-Markovian latent variables."""
-        # States that require positional precision get small offsets; all others get large offsets.
-        LOW_STD_STATES = {"reach_table_top_z", "pre_screw"}
-        ZERO_STD_STATES = {"screw_grasp", "screw", "insert_release", "reach_leg_floor_z"}
+        if not self._NM_LATENT_PLAN:
+            return
+
         HIGH_STD = 0.020  # m — persistent offset for coarse-motion states
         LOW_STD = 0.003  # m — persistent offset for precision states
 
@@ -92,54 +93,15 @@ class Leg(Part):
             "screw_grasp",
             "screw",
         ]
-        if self._NM_LATENT_PLAN:
-            self.latent_offsets = {
-                state: np.random.normal(
-                    0, 0 if state in ZERO_STD_STATES else LOW_STD if state in LOW_STD_STATES else HIGH_STD, size=(3,)
-                )
-                for state in all_states
-            }
 
-        if self._NM_STEP_NOISE:
-            # Per-step shifting noise: same std tiers as the latent plan.
-            # At each step, a new noise vector is sampled with probability switch_prob,
-            # replacing the current one; otherwise the existing vector persists.
-            # switch_prob = 0.1 → geometric mean persistence of 10 steps (~1 second).
-            self.step_noise_switch_prob = 0.1
-            self.step_noise_stds = {
-                state: 0.0 if state in ZERO_STD_STATES else LOW_STD if state in LOW_STD_STATES else HIGH_STD
-                for state in all_states
-            }
-            self._step_noise = {}  # vectors will be lazily sampled on first encounter
+        def std_for(state):
+            if state in self._ZERO_TARGET_STD_STATES:
+                return 0.0
+            if state in self._LOW_TARGET_STD_STATES:
+                return LOW_STD
+            return HIGH_STD
 
-    def _apply_latent_offset(self, state: str, clean_target):
-        """Apply non-Markovian position offsets to clean_target[:3, 3]:
-        1. Episode-level latent plan offset (fixed for the episode).
-        2. Per-step shifting noise (resampled probabilistically each step).
-        Both are additive; either is a no-op when its config dict is empty.
-        """
-        cloned = False
-
-        # 1. Episode-level latent plan offset (sampled once in apply_non_markovian_config)
-        if self.latent_offsets:
-            offset = self.latent_offsets.get(state)
-            if offset is not None:
-                clean_target = clean_target.clone()
-                cloned = True
-                clean_target[:3, 3] += torch.tensor(offset, device=clean_target.device, dtype=clean_target.dtype)
-
-        # 2. Per-step shifting noise
-        if self.step_noise_stds:
-            std = self.step_noise_stds.get(state, 0.0)
-            # Resample with probability switch_prob; initialise lazily on first encounter.
-            if state not in self._step_noise or np.random.random() < self.step_noise_switch_prob:
-                self._step_noise[state] = np.random.normal(0, std, size=(3,))
-            step_offset = self._step_noise[state]
-            if not cloned:
-                clean_target = clean_target.clone()
-            clean_target[:3, 3] += torch.tensor(step_offset, device=clean_target.device, dtype=clean_target.dtype)
-
-        return clean_target
+        self.latent_offsets = {state: np.random.normal(0, std_for(state), size=(3,)) for state in all_states}
 
     def is_in_reset_ori(self, pose: npt.NDArray[np.float32], from_skill, ori_bound) -> bool:
         # y-axis of the leg align with y-axis of the base.
@@ -545,7 +507,12 @@ class Leg(Part):
             target_pos[2] = ee_pos[2]
             clean_target = C.to_homogeneous(target_pos, target_ori)
             clean_target = self._apply_latent_offset(state, clean_target)
-            target = self._add_noise(clean_target, pos_std=0.007, ori_std_deg=5.0)
+            if self.non_markovian:
+                target = self._add_noise_to_target(
+                    clean_target, pos_std=0.007, ori_std_deg=5.0, step_noise_pos_std=0.01, step_noise_ori_std_deg=5.0
+                )
+            else:
+                target = self._add_noise_to_target(clean_target, pos_std=0.007, ori_std_deg=5.0)
             # Large XY motion from neutral to leg (can be 10-15 cm); needs many steps.
             result = self.satisfy(ee_pose, target, pos_error_threshold=0.02, max_len=150)
             if result == "TIMEOUT":
@@ -559,7 +526,12 @@ class Leg(Part):
             target_pos[2] = leg_pos_robot[2] + self._ORI_Z_CLEARANCE  # keep clearance above leg during EE rotation
             clean_target = C.to_homogeneous(target_pos, target_ori)
             clean_target = self._apply_latent_offset(state, clean_target)
-            target = self._add_noise(clean_target, pos_std=0.01, ori_std_deg=5)
+            if self.non_markovian:
+                target = self._add_noise_to_target(
+                    clean_target, pos_std=0.01, ori_std_deg=2.5, step_noise_pos_std=0.01, step_noise_ori_std_deg=2.5
+                )
+            else:
+                target = self._add_noise_to_target(clean_target, pos_std=0.01, ori_std_deg=5)
             result = self.satisfy(ee_pose, target, pos_error_threshold=0.015, ori_error_threshold=0.1, max_len=150)
             if result == "TIMEOUT":
                 timeout_failure = True
@@ -572,7 +544,9 @@ class Leg(Part):
             target_pos[2] = leg_pos_robot[2] + self._PICK_Z_OFFSET
             clean_target = C.to_homogeneous(target_pos, target_ori)
             clean_target = self._apply_latent_offset(state, clean_target)
-            target = self._add_noise(clean_target, pos_std=0.01, ori_std_deg=15.0)
+            target = self._add_noise_to_target(
+                clean_target, pos_std=0.01, ori_std_deg=12.0, step_noise_pos_std=0.005, step_noise_ori_std_deg=2.0
+            )
             result = self.satisfy(ee_pose, target, pos_error_threshold=0.015, ori_error_threshold=0.3, max_len=150)
             if result == "TIMEOUT":
                 timeout_failure = True
@@ -585,7 +559,12 @@ class Leg(Part):
             target_pos[2] = leg_pos_robot[2] + self._PICK_Z_OFFSET
             clean_target = C.to_homogeneous(target_pos, target_ori)
             clean_target = self._apply_latent_offset(state, clean_target)
-            target = self._add_noise(clean_target, pos_std=0.01, ori_std_deg=15.0)
+            if self.non_markovian:
+                target = self._add_noise_to_target(
+                    clean_target, pos_std=0.008, ori_std_deg=15.0, step_noise_pos_std=0.002, step_noise_ori_std_deg=2.0
+                )
+            else:
+                target = self._add_noise_to_target(clean_target, pos_std=0.01, ori_std_deg=15.0)
             self.gripper_action = 1
             result = self.gripper_less(gripper_width, 2 * self.half_width + 0.001)
             if result == "TIMEOUT":
@@ -598,7 +577,8 @@ class Leg(Part):
             target_ori = ee_pose[:3, :3]
             clean_target = C.to_homogeneous(target_pos, target_ori)
             clean_target = self._apply_latent_offset(state, clean_target)
-            target = self._add_noise(clean_target)
+            if self.non_markovian:
+                target = self._add_noise_to_target(clean_target, step_noise_pos_std=0.020, step_noise_ori_std_deg=5.0)
             result = self.satisfy(ee_pose, target, pos_error_threshold=0.02, ori_error_threshold=0.3, max_len=150)
             if result == "TIMEOUT":
                 timeout_failure = True
@@ -607,7 +587,12 @@ class Leg(Part):
             target_pos = self.staging_pos
             clean_target = C.to_homogeneous(target_pos, target_ori)
             clean_target = self._apply_latent_offset(state, clean_target)
-            target = self._add_noise(clean_target, pos_std=0.002, ori_std_deg=0.5)
+            if self.non_markovian:
+                target = self._add_noise_to_target(
+                    clean_target, pos_std=0.002, ori_std_deg=0.5, step_noise_pos_std=0.020, step_noise_ori_std_deg=5.0
+                )
+            else:
+                target = self._add_noise_to_target(clean_target, pos_std=0.002, ori_std_deg=0.5)
             result = self.satisfy(ee_pose, target, pos_error_threshold=0.02, ori_error_threshold=0.3, max_len=150)
             if result == "TIMEOUT":
                 timeout_failure = True
@@ -633,7 +618,12 @@ class Leg(Part):
             rel = rel_rot_mat(leg_tip_pose_robot, target_leg_tip_pose_robot)
             clean_target = rel @ ee_pose
             clean_target = self._apply_latent_offset(state, clean_target)
-            target = self._add_noise(clean_target, pos_std=0.002, ori_std_deg=0.5)
+            if self.non_markovian:
+                target = self._add_noise_to_target(
+                    clean_target, pos_std=0.002, ori_std_deg=0.5, step_noise_pos_std=0.010, step_noise_ori_std_deg=5.0
+                )
+            else:
+                target = self._add_noise_to_target(clean_target, pos_std=0.002, ori_std_deg=0.5)
             result = self.satisfy(ee_pose, target, pos_error_threshold=0.015, ori_error_threshold=0.3, max_len=150)
             if result == "TIMEOUT":
                 timeout_failure = True
@@ -657,16 +647,35 @@ class Leg(Part):
             target_leg_tip_pose_robot[:3, :3] = ry3 @ target_leg_tip_pose_robot[:3, :3]  # Apply y-axis rotation
             rel = rel_rot_mat(leg_tip_pose_robot, target_leg_tip_pose_robot)
             clean_target = rel @ ee_pose
-            clean_target = self._apply_latent_offset(state, clean_target)
+            # NOTE: DO NOT _apply_latent_offset() here, since we need precision during insertion
             # Don't add as much noise if the leg got stuck
             # Note that this is non-markovian but doesn't make the policy non-markovian,
             # since this only affects the noise added during simulation, doesn't affect the actual recorded actions.
             if not self.GOT_STUCK:
-                target = self._add_noise(
-                    clean_target, pos_std=0.004, pos_std_z=0.0, ori_std_deg=2.5, pos_max=0.005, ori_max_deg=4.0
-                )
+                if self.non_markovian:
+                    target = self._add_noise_to_target(
+                        clean_target,
+                        pos_std=0.002,
+                        pos_std_z=0.0,
+                        ori_std_deg=2.0,
+                        pos_max=0.005,
+                        ori_max_deg=4.0,
+                        step_noise_pos_std=0.002,
+                        step_noise_pos_std_z=0.0,
+                        step_noise_ori_std_deg=1.0,
+                    )
+                else:
+                    target = self._add_noise_to_target(
+                        clean_target,
+                        pos_std=0.004,
+                        pos_std_z=0.0,
+                        ori_std_deg=2.5,
+                        pos_max=0.005,
+                        ori_max_deg=4.0,
+                        step_noise_pos_std=0.003,
+                    )
             else:
-                target = self._add_noise(clean_target, pos_std=0.0, ori_std_deg=0.0)
+                target = self._add_noise_to_target(clean_target, pos_std=0.0, ori_std_deg=0.0)
             result = self.satisfy(ee_pose, target, pos_error_threshold=0.007, ori_error_threshold=0.15, max_len=75)
             if result == "TIMEOUT":
                 timeout_failure = True
@@ -688,7 +697,9 @@ class Leg(Part):
                 rel = rel_rot_mat(leg_tip_pose_robot, target_leg_tip_pose_robot)
                 clean_target = rel @ ee_pose
                 clean_target = self._apply_latent_offset(state, clean_target)
-                target = self._add_noise(clean_target, pos_std=0.001, ori_std_deg=1.0)
+                target = self._add_noise_to_target(
+                    clean_target, pos_std=0.001, ori_std_deg=1.0
+                )  # zero step noise (ZERO tier)
             else:
                 # Gripper still closing around the leg — hold EE position, keep opening.
                 clean_target = ee_pose.clone()
@@ -705,7 +716,12 @@ class Leg(Part):
             target_pos[2] += self.grasp_margin_z
             clean_target = C.to_homogeneous(target_pos, target_ori)
             clean_target = self._apply_latent_offset(state, clean_target)
-            target = self._add_noise(clean_target, pos_std=0.001, ori_std_deg=1.0)
+            if self.non_markovian:
+                target = self._add_noise_to_target(
+                    clean_target, pos_std=0.001, ori_std_deg=1.0, step_noise_pos_std=0.003, step_noise_ori_std_deg=1.0
+                )
+            else:
+                target = self._add_noise_to_target(clean_target, pos_std=0.001, ori_std_deg=1.0)
             self.gripper_action = -1
             result = self.gripper_greater(
                 gripper_width,
@@ -715,7 +731,7 @@ class Leg(Part):
                 timeout_failure = True
         elif state == "pre_screw":
             target_pos = (april_to_robot @ leg_pose)[:3, 3].clone()
-            target_pos[2] = 0.055
+            target_pos[2] = 0.055 if not self._NM_STEP_NOISE else 0.061  # A little higher if there is target step noise
 
             ee_z_dot_down = -ee_pose[2, 2]  # 1.0 = EE Z-axis straight down
             ee_x_dot_world_x = ee_pose[0, 0]  # X-component of EE local-X (world frame)
@@ -739,7 +755,12 @@ class Leg(Part):
 
             clean_target = C.to_homogeneous(target_pos, target_ori)
             clean_target = self._apply_latent_offset(state, clean_target)
-            target = self._add_noise(clean_target, pos_std=0.0, ori_std_deg=0.0)
+            if self.non_markovian:
+                target = self._add_noise_to_target(
+                    clean_target, pos_std=0.0, ori_std_deg=0.0, step_noise_pos_std=0.003, step_noise_ori_std_deg=1.0
+                )
+            else:
+                target = self._add_noise_to_target(clean_target, pos_std=0.0, ori_std_deg=0.0)
             result = self.satisfy(ee_pose, target, max_len=300)
             if result == "TIMEOUT":
                 timeout_failure = True
@@ -751,7 +772,7 @@ class Leg(Part):
             target_ori = C.rot_mat_tensor(np.pi, 0, np.pi, device)[:3, :3]
             clean_target = C.to_homogeneous(target_pos, target_ori)
             clean_target = self._apply_latent_offset(state, clean_target)
-            target = self._add_noise(clean_target, pos_std=0.0, ori_std_deg=0.0)
+            target = self._add_noise_to_target(clean_target, pos_std=0.0, ori_std_deg=0.0)  # NO NOISE during grasp
             self.gripper_action = 1
             result = self.gripper_less(gripper_width, 2 * self.half_width + 0.001)
             if result == "TIMEOUT":
@@ -793,7 +814,7 @@ class Leg(Part):
 
             clean_target = C.to_homogeneous(target_pos, target_ori)
             clean_target = self._apply_latent_offset(state, clean_target)
-            target = self._add_noise(clean_target, pos_std=0.0, ori_std_deg=0.0)
+            target = self._add_noise_to_target(clean_target, pos_std=0.0, ori_std_deg=0.0)  # NO NOISE during screw
             result = self.satisfy(ee_pose, target, ori_error_threshold=0.3, max_len=75)
             if result == "TIMEOUT":
                 timeout_failure = True
@@ -810,25 +831,14 @@ class Leg(Part):
             timeout_failure,
         )
 
-    def state_no_noise(self):
-        return self._last_state in [
-            "insert_release",
-        ]
+    def current_state_no_noise(self):
+        return self._last_state in self._NO_ACTION_NOISE_STATES
 
-    def state_low_action_noise(self):
-        # Add just action noise (but no target noise) for screwing states
-        return self._last_state in [
-            "reach_table_top_z",
-            "pre_screw",
-            "screw_grasp",
-            "screw",
-        ]
+    def current_state_low_action_noise(self):
+        return self._last_state in self._LOW_ACTION_NOISE_STATES
 
-    def state_clean_action_noise(self):
-        # Add noise to the recorded actions during leg insertion
-        return self._last_state in [
-            "reach_table_top_z",
-        ]
+    def current_state_clean_action_noise(self):
+        return self._last_state in self._CLEAN_ACTION_NOISE_STATES
 
     def _find_closest_y(self, pose):
         closest_y = pose.clone()

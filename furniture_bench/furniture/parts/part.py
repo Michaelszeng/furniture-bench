@@ -15,6 +15,15 @@ from furniture_bench.utils.pose import get_mat, is_similar_pos, is_similar_pose,
 
 
 class Part(ABC):
+    _NM_LATENT_PLAN: bool = False  # episode-level fixed position offsets per state
+    _NM_STEP_NOISE: bool = True  # per-step persistent target-noise; stds passed per call to _add_noise_to_target()
+    _NM_PAUSES: bool = False  # inject random-length hold at each FSM state transition
+
+    _NM_STEP_NOISE_SWITCH_PROB: float = 0.15  # probability of resampling the step noise each timestep
+
+    _NM_MAX_PAUSE: int = 10  # max pause duration (steps); also added to every satisfy() timeout budget
+    _NM_PAUSE_EXCLUDED_STATES: frozenset = frozenset()  # states where no pause is injected
+
     @abstractmethod
     def __init__(self, part_config, part_idx: int):
         # Three pose filter. (Each camera has filter.)
@@ -45,8 +54,10 @@ class Part(ABC):
         self.curr_cnt = 0
         self.part_moved_skill_idx = part_config.get("part_moved_skill_idx", np.inf)
         self.part_attached_skill_idx = part_config.get("part_attached_skill_idx", np.inf)
-        self.no_noise = False
+        self.no_noise = False  # set by --no-noise: disables ALL noise including step noise
+        self.no_iid_target_noise = False  # set by _ENABLE_TARGET_NOISE=False: disables only i.i.d. per-step jitter
         self.dart_amount = 1.0
+        self.non_markovian = False
 
     def randomize_init_pose(self, from_skill=0, pos_range=[-0.05, 0.05], rot_range=45):
         self.reset_pos[from_skill][:2] = self.part_config["reset_pos"][from_skill][:2] + np.random.uniform(
@@ -239,7 +250,7 @@ class Part(ABC):
         # Only fire skill_complete on the step we first enter a skill_complete state
         return 1 if (new_state != prev_state and new_state in self.skill_complete_next_states) else 0
 
-    def _add_noise(
+    def _add_noise_to_target(
         self,
         target,
         pos_std=0.004,
@@ -247,40 +258,73 @@ class Part(ABC):
         ori_std_deg=4.0,
         pos_max=None,
         ori_max_deg=None,
+        step_noise_pos_std=0.0,
+        step_noise_pos_std_z=None,
+        step_noise_ori_std_deg=0.0,
     ):
-        """
-        Add noise to TARGET.
+        """Add noise to TARGET.
+
+        Step noise (persistent, probabilistically switched) and i.i.d. per-step noise are accumulated
+        into a single combined vector before clipping and application.
 
         Args:
-            pos_max: if given, clamp each position noise component to [-pos_max, pos_max].
-            ori_max_deg: if given, clamp each axis-angle noise component to [-ori_max_deg, ori_max_deg].
-            pos_std_z: if given, use this std for the z position noise instead of pos_std.
+            pos_std / pos_std_z / ori_std_deg: i.i.d. per-step noise stds (position in m, orientation in deg).
+            pos_max / ori_max_deg: clip the COMBINED (step + i.i.d.) noise to [-x, x].
+            step_noise_pos_std / step_noise_pos_std_z / step_noise_ori_std_deg: persistent step-noise stds;
+                each component is multiplied by self.dart_amount. Default 0 = no step noise.
         """
-        if self.no_noise or self.state_no_noise():
+        if self.no_noise:
             return target
+
         noisy = target.clone()
-        scaled_pos_std = pos_std * self.dart_amount
-        scaled_pos_std_z = (pos_std_z if pos_std_z is not None else pos_std) * self.dart_amount
-        std = torch.tensor([scaled_pos_std, scaled_pos_std, scaled_pos_std_z], dtype=torch.float32)
-        pos_noise = torch.normal(mean=torch.zeros(3), std=std)
+        device = target.device
+        total_pos_noise = torch.zeros(3, dtype=target.dtype, device=device)
+        total_ori_noise = np.zeros(3)
+
+        # NM step noise: persistent offset that switches probabilistically each step.
+        if self.non_markovian and self._NM_STEP_NOISE and (step_noise_pos_std > 0.0 or step_noise_ori_std_deg > 0.0):
+            state = self._last_state
+            if state not in self._step_noise or np.random.random() < self._NM_STEP_NOISE_SWITCH_PROB:
+                sp = step_noise_pos_std * self.dart_amount
+                sz = (
+                    step_noise_pos_std_z if step_noise_pos_std_z is not None else step_noise_pos_std
+                ) * self.dart_amount
+                so = np.radians(step_noise_ori_std_deg * self.dart_amount)
+                self._step_noise[state] = {
+                    "pos": np.random.normal(0, [sp, sp, sz]),
+                    "ori": np.random.normal(0, so, size=3),
+                }
+            step = self._step_noise[state]
+            total_pos_noise += torch.tensor(step["pos"], dtype=target.dtype, device=device)
+            total_ori_noise += step["ori"]
+
+        # i.i.d. per-step jitter.
+        if not self.no_iid_target_noise and not self.current_state_no_noise():
+            scaled_pos_std = pos_std * self.dart_amount
+            scaled_pos_std_z = (pos_std_z if pos_std_z is not None else pos_std) * self.dart_amount
+            iid_pos = torch.normal(
+                mean=torch.zeros(3),
+                std=torch.tensor([scaled_pos_std, scaled_pos_std, scaled_pos_std_z], dtype=torch.float32),
+            )
+            total_pos_noise += iid_pos.to(device)
+            scaled_ori_std_rad = np.radians(ori_std_deg * self.dart_amount)
+            total_ori_noise += np.random.normal(0, scaled_ori_std_rad, size=3)
+
+        # Apply combined noise, clipping first if requested.
         if pos_max is not None:
-            pos_noise = pos_noise.clamp(-pos_max, pos_max)
-        noisy[:3, 3] += pos_noise.to(target.device)
-        scaled_ori_std_deg = ori_std_deg * self.dart_amount
-        ori_noise = [
-            np.radians(np.random.normal(0, scaled_ori_std_deg)),
-            np.radians(np.random.normal(0, scaled_ori_std_deg)),
-            np.radians(np.random.normal(0, scaled_ori_std_deg)),
-        ]
-        if ori_max_deg is not None:
-            ori_max_rad = np.radians(ori_max_deg)
-            ori_noise = [np.clip(v, -ori_max_rad, ori_max_rad) for v in ori_noise]
-        ori = C.mat2quat(noisy[:3, :3]).to(target.device)
-        ori = C.quat_multiply(
-            ori,
-            torch.tensor(T.axisangle2quat(ori_noise), device=target.device),
-        ).to(target.device)
-        noisy[:3, :3] = C.quat2mat(ori)
+            total_pos_noise = total_pos_noise.clamp(-pos_max, pos_max)
+        noisy[:3, 3] += total_pos_noise
+
+        if total_ori_noise.any():
+            if ori_max_deg is not None:
+                total_ori_noise = np.clip(total_ori_noise, -np.radians(ori_max_deg), np.radians(ori_max_deg))
+            ori = C.mat2quat(noisy[:3, :3]).to(device)
+            ori = C.quat_multiply(
+                ori,
+                torch.tensor(T.axisangle2quat(total_ori_noise.tolist()), device=device),
+            ).to(device)
+            noisy[:3, :3] = C.quat2mat(ori)
+
         return noisy
 
     def reset(self):
@@ -290,17 +334,31 @@ class Part(ABC):
         self.prev_cnt = 0
         self.curr_cnt = 0
         self.max_len_offset = 0  # extra steps added to every satisfy() budget; set to _NM_MAX_PAUSE for non-Markovian
+        # Non-Markovian latent offset (populated by apply_non_markovian_config)
+        self.latent_offsets = {}
+        self._step_noise = {}
         # Backward-compat reset for non-Markovian parts
         self.first_setting_target = True
         self.target = None
 
-    def state_no_noise(self):
+    def _apply_latent_offset(self, state: str, clean_target):
+        """Apply the episode-level latent plan offset to clean_target[:3, 3].
+        No-op when latent_offsets is empty (non-Markovian disabled or _NM_LATENT_PLAN=False).
+        """
+        if self.latent_offsets:
+            offset = self.latent_offsets.get(state)
+            if offset is not None:
+                clean_target = clean_target.clone()
+                clean_target[:3, 3] += torch.tensor(offset, device=clean_target.device, dtype=clean_target.dtype)
+        return clean_target
+
+    def current_state_no_noise(self):
         return False
 
-    def state_low_action_noise(self):
+    def current_state_low_action_noise(self):
         return False
 
-    def state_clean_action_noise(self):
+    def current_state_clean_action_noise(self):
         """Return True if the clean_action should also have noise added in this state."""
         return False
 
@@ -326,7 +384,7 @@ class Part(ABC):
         noise each timestep).
         TODO: REMOVE THIS.
         """
-        if self.no_noise or self.state_no_noise():
+        if self.no_noise or self.no_iid_target_noise or self.current_state_no_noise():
             return target
         if self.first_setting_target:
             if pos_noise is not None:

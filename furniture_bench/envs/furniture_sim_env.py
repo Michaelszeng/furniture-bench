@@ -40,7 +40,6 @@ from furniture_bench.envs.observation import (
 
 # from furniture_bench.controllers.diffik_qp import diffik_factory
 from furniture_bench.furniture import furniture_factory
-from furniture_bench.furniture.parts.leg import Leg
 from furniture_bench.furniture.parts.part import Part
 from furniture_bench.robot.robot_state import ROBOT_STATE_DIMS
 from furniture_bench.sim_config import sim_config
@@ -52,13 +51,13 @@ ASSET_ROOT = str(Path(__file__).parent.parent.absolute() / "assets")
 # Noise enable/disable flags for scripted policy
 # (for testing — override runtime no_noise flag)
 # ---------------------------------------------------------------------------
-# Target noise: (1) FSM per-step goal-pose jitter via _add_noise() [main jitter source];
+# Target noise: (1) FSM per-step goal-pose jitter via _add_noise_to_target() [main jitter source];
 #               (2) randomised kick multiplier and XY speed limit in _compute_delta_pos.
 _ENABLE_TARGET_NOISE: bool = False
 # Action noise: i.i.d. Gaussian on delta_pos and orientation
 _ENABLE_ACTION_NOISE: bool = False
 # Temporally correlated (OU) action noise (non-Markovian only); independent of i.i.d. noise
-_ENABLE_CORR_ACTION_NOISE: bool = True
+_ENABLE_CORR_ACTION_NOISE: bool = False
 # OU smoothing factor: τ = 1/(1-alpha) steps.  0.97 → τ≈33 steps (~3 s at 10 Hz).
 _CORR_NOISE_ALPHA: float = 0.95
 
@@ -181,13 +180,18 @@ class FurnitureSimEnv(gym.Env):
         self._nm_prev_state_key = [None] * num_envs  # (assemble_idx, part_name, fsm_state) of last FSM call
         self._nm_pause_gripper = [-1.0] * num_envs  # gripper command to hold during pause
         self.dart_amount = dart_amount
-        if no_noise or not _ENABLE_TARGET_NOISE:
-            for furn in self.furnitures:
-                for part in furn.parts:
+        for furn in self.furnitures:
+            for part in furn.parts:
+                if no_noise:
                     part.no_noise = True
-            if self.furniture not in self.furnitures:
-                for part in self.furniture.parts:
+                if not _ENABLE_TARGET_NOISE:
+                    part.no_iid_target_noise = True
+        if self.furniture not in self.furnitures:
+            for part in self.furniture.parts:
+                if no_noise:
                     part.no_noise = True
+                if not _ENABLE_TARGET_NOISE:
+                    part.no_iid_target_noise = True
         if dart_amount != 1.0:
             for furn in self.furnitures:
                 for part in furn.parts:
@@ -195,6 +199,12 @@ class FurnitureSimEnv(gym.Env):
             if self.furniture not in self.furnitures:
                 for part in self.furniture.parts:
                     part.dart_amount = dart_amount
+        for furn in self.furnitures:
+            for part in furn.parts:
+                part.non_markovian = non_markovian
+        if self.furniture not in self.furnitures:
+            for part in self.furniture.parts:
+                part.non_markovian = non_markovian
 
         self._create_ground_plane()
         self._setup_lights()
@@ -1577,7 +1587,7 @@ class FurnitureSimEnv(gym.Env):
             part2_pre_assemble_done = not hasattr(part2, "compute_pre_assemble_state") or part2.pre_assemble_done
 
             # ── Non-Markovian pause: hold still without calling the FSM ──────────────
-            if self.non_markovian and Leg._NM_PAUSES and self._nm_pause_remaining[env_idx] > 0:
+            if self.non_markovian and self._nm_pause_remaining[env_idx] > 0:
                 self._nm_pause_remaining[env_idx] -= 1
                 hold = torch.zeros(8, dtype=torch.float32, device=self.device)
                 hold[6] = 1.0  # qw=1 (identity quaternion, same layout as timeout zero_action)
@@ -1659,15 +1669,13 @@ class FurnitureSimEnv(gym.Env):
                 continue
 
             # ── Non-Markovian pause: detect state transition, arm pause for next step ─
-            if self.non_markovian and Leg._NM_PAUSES:
-                active_part = part1 if not part1_pre_assemble_done else part2
+            active_part = part1 if not part1_pre_assemble_done else part2
+            if self.non_markovian and active_part._NM_PAUSES:
                 new_key = (assemble_idx, active_part.name, getattr(active_part, "_last_state", None))
                 if new_key != self._nm_prev_state_key[env_idx]:
                     self._nm_prev_state_key[env_idx] = new_key
-                    excluded = getattr(active_part, "_NM_PAUSE_EXCLUDED_STATES", frozenset())
-                    if active_part._last_state not in excluded:
-                        pause_max = getattr(active_part, "_NM_MAX_PAUSE", Leg._NM_MAX_PAUSE)
-                        self._nm_pause_remaining[env_idx] = int(np.random.randint(0, pause_max + 1))
+                    if active_part._last_state not in active_part._NM_PAUSE_EXCLUDED_STATES:
+                        self._nm_pause_remaining[env_idx] = int(np.random.randint(0, active_part._NM_MAX_PAUSE + 1))
                         self._nm_pause_gripper[env_idx] = float(gripper[0].item())
             # ─────────────────────────────────────────────────────────────────────────
 
@@ -1709,13 +1717,13 @@ class FurnitureSimEnv(gym.Env):
             clean_action = torch.concat([clean_delta_pos, clean_delta_quat, gripper])
 
             # Noise scale shared by both i.i.d. and corr noise blocks.
-            _state_no_noise = self.furnitures[env_idx].parts[part_idx2].state_no_noise()
-            _low_noise = self.furnitures[env_idx].parts[part_idx2].state_low_action_noise()
+            _current_state_no_noise = self.furnitures[env_idx].parts[part_idx2].current_state_no_noise()
+            _low_noise = self.furnitures[env_idx].parts[part_idx2].current_state_low_action_noise()
             _action_noise_scale = 0.5 if _low_noise else 1.0
 
             # Randomly add i.i.d. noise to the executed action (not recorded).
             # Low-action-noise states get half the standard deviation and hard clips.
-            if _ENABLE_ACTION_NOISE and not self.no_noise and not _state_no_noise:
+            if _ENABLE_ACTION_NOISE and not self.no_noise and not _current_state_no_noise:
                 pos_noise = torch.normal(torch.zeros_like(delta_pos), 0.005 * _action_noise_scale * self.dart_amount)
                 if _low_noise:
                     pos_clip = 0.005 * self.dart_amount
@@ -1737,7 +1745,7 @@ class FurnitureSimEnv(gym.Env):
             # Temporally correlated (OU) noise — independent of i.i.d. noise above.
             # Update rule (variance-preserving): z_t = alpha·z_{t-1} + √(1-alpha²)·ε_t
             # alpha=0 → pure i.i.d.; alpha→1 → slow drift with τ = 1/(1-alpha) steps.
-            if _ENABLE_CORR_ACTION_NOISE and not self.no_noise and not _state_no_noise and self.non_markovian:
+            if _ENABLE_CORR_ACTION_NOISE and not self.no_noise and not _current_state_no_noise and self.non_markovian:
                 alpha = _CORR_NOISE_ALPHA
                 scale = np.sqrt(1.0 - alpha**2)
                 key = (env_idx, part_idx2)
@@ -1764,7 +1772,7 @@ class FurnitureSimEnv(gym.Env):
             if (
                 _ENABLE_ACTION_NOISE
                 and not self.no_noise
-                and self.furnitures[env_idx].parts[part_idx2].state_clean_action_noise()
+                and self.furnitures[env_idx].parts[part_idx2].current_state_clean_action_noise()
             ):
                 clean_action = noisy_action
 
