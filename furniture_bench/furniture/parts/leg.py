@@ -200,12 +200,7 @@ class Leg(Part):
         leg_tip_z_rel = leg_z_rel - leg_pose_robot[2, 1] * self._LEG_TIP_OFFSET
 
         ################################################################################################################
-        # NON-MARKOVIAN: sequential state machine
-        ################################################################################################################
-        # TODO
-
-        ################################################################################################################
-        # MARKOVIAN: FSM state determined entirely via environment state
+        # SHARED TARGET POSES
         ################################################################################################################
         ### DEFINE TARGET POSES ###
         leg_xy = leg_pose_robot[:2, 3]
@@ -320,7 +315,14 @@ class Leg(Part):
         at_grasp_ori_floor = (ee_pose[:3, :3] - grasp_target_ori).abs().sum() < self.ori_error_threshold * 3
         at_pick_z = abs(ee_pos[2] - pick_target_z) < self.pos_error_threshold
 
-        ### STATE SELECTION ###
+        ################################################################################################################
+        # NON-MARKOVIAN: sequential state machine
+        ################################################################################################################
+        # TODO
+
+        ################################################################################################################
+        # MARKOVIAN: FSM state determined entirely via environment state
+        ################################################################################################################
         # ── Phase 1: GRASPED ─────────────────────────────────────────────────
         # Primary discriminator: leg is physically between the gripper fingers.
         if gripper_grasped:
