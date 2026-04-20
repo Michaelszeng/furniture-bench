@@ -15,8 +15,8 @@ from furniture_bench.utils.pose import get_mat, is_similar_pos, is_similar_pose,
 
 
 class Part(ABC):
-    _NM_LATENT_PLAN: bool = False  # episode-level fixed position offsets per state
-    _NM_STEP_NOISE: bool = True  # per-step persistent target-noise; stds passed per call to _add_noise_to_target()
+    _NM_LATENT_PLAN: bool = True  # episode-level fixed position offsets per state
+    _NM_STEP_NOISE: bool = False  # per-step persistent target-noise; stds passed per call to _add_noise_to_target()
     _NM_PAUSES: bool = False  # inject random-length hold at each FSM state transition
 
     _NM_STEP_NOISE_SWITCH_PROB: float = 0.15  # probability of resampling the step noise each timestep
@@ -341,15 +341,41 @@ class Part(ABC):
         self.first_setting_target = True
         self.target = None
 
+    def _lo(self, state: str = None) -> np.ndarray:
+        """Return the 3-element position latent offset for `state` (default: _last_state).
+        Returns zeros when _NM_LATENT_PLAN is off or the state has no entry."""
+        if not self._NM_LATENT_PLAN:
+            return np.zeros(3)
+        s = state if state is not None else self._last_state
+        entry = self.latent_offsets.get(s)
+        return entry["pos"] if entry is not None else np.zeros(3)
+
+    def _lo_ori(self, state: str = None) -> np.ndarray:
+        """Return the 3-element axis-angle orientation latent offset for `state` (default: _last_state).
+        Returns zeros when _NM_LATENT_PLAN is off or the state has no entry."""
+        if not self._NM_LATENT_PLAN:
+            return np.zeros(3)
+        s = state if state is not None else self._last_state
+        entry = self.latent_offsets.get(s)
+        return entry["ori"] if entry is not None else np.zeros(3)
+
     def _apply_latent_offset(self, state: str, clean_target):
-        """Apply the episode-level latent plan offset to clean_target[:3, 3].
+        """Apply the episode-level latent plan offset (position + orientation) to clean_target.
         No-op when latent_offsets is empty (non-Markovian disabled or _NM_LATENT_PLAN=False).
         """
         if self.latent_offsets:
             offset = self.latent_offsets.get(state)
             if offset is not None:
                 clean_target = clean_target.clone()
-                clean_target[:3, 3] += torch.tensor(offset, device=clean_target.device, dtype=clean_target.dtype)
+                device = clean_target.device
+                clean_target[:3, 3] += torch.tensor(offset["pos"], device=device, dtype=clean_target.dtype)
+                ori_vec = offset["ori"]
+                if np.any(ori_vec):
+                    quat = C.mat2quat(clean_target[:3, :3])
+                    delta = torch.tensor(
+                        T.axisangle2quat(ori_vec.tolist()), device=device, dtype=clean_target.dtype
+                    )
+                    clean_target[:3, :3] = C.quat2mat(C.quat_multiply(quat, delta))
         return clean_target
 
     def current_state_no_noise(self):

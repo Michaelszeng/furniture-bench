@@ -1,3 +1,5 @@
+from re import L
+
 import numpy as np
 import numpy.typing as npt
 import torch
@@ -17,8 +19,10 @@ class TableTop(Part):
     # Target-noise tiers (used by apply_non_markovian_config for latent offsets / step noise stds).
     # NOTE: these do not affect the random per-step target noise in _add_noise_to_target(), only affect the latent
     # plan offsets and step noise stds.
-    _LOW_TARGET_STD_STATES: frozenset = frozenset({"reach_body_grasp_z", "push", "pick_body", "release", "done"})
-    _ZERO_TARGET_STD_STATES: frozenset = frozenset({})
+    _LOW_LATENT_TARGET_STD_STATES: frozenset = frozenset(
+        {"reach_body_grasp_z", "push", "pick_body", "release", "go_up", "done"}
+    )
+    _ZERO_LATENT_TARGET_STD_STATES: frozenset = frozenset({})
 
     def __init__(self, part_config: dict, part_idx: int):
         super().__init__(part_config, part_idx)
@@ -47,6 +51,8 @@ class TableTop(Part):
 
         HIGH_STD = 0.020
         LOW_STD = 0.003
+        HIGH_ORI_STD = np.radians(5.0)
+        LOW_ORI_STD = np.radians(2.0)
 
         all_states = [
             "reach_body_grasp_xy",
@@ -57,18 +63,32 @@ class TableTop(Part):
             "go_up",
             "done",
         ]
+
+        def pos_std_for(state):
+            if state in self._ZERO_LATENT_TARGET_STD_STATES:
+                return 0.0
+            if state in self._LOW_LATENT_TARGET_STD_STATES:
+                return LOW_STD
+            return HIGH_STD
+
+        def ori_std_for(state):
+            if state in self._ZERO_LATENT_TARGET_STD_STATES:
+                return 0.0
+            if state in self._LOW_LATENT_TARGET_STD_STATES:
+                return LOW_ORI_STD
+            return HIGH_ORI_STD
+
         self.latent_offsets = {
-            state: np.random.normal(
-                0,
-                0.0
-                if state in self._ZERO_TARGET_STD_STATES
-                else LOW_STD
-                if state in self._LOW_TARGET_STD_STATES
-                else HIGH_STD,
-                size=(3,),
-            )
+            state: {
+                "pos": np.random.normal(0, pos_std_for(state), size=(3,)),
+                "ori": np.random.normal(0, ori_std_for(state), size=(3,)),
+            }
             for state in all_states
         }
+        offsets_str = "\n".join(
+            f"  {state}: pos={v['pos']}, ori={v['ori']}" for state, v in self.latent_offsets.items()
+        )
+        print(f"latent_offsets:\n{offsets_str}")
 
     def is_in_reset_ori(self, pose, from_skill, ori_bound):
         reset_ori = self.reset_ori[from_skill] if len(self.reset_ori) > 1 else self.reset_ori[0]
@@ -155,29 +175,80 @@ class TableTop(Part):
     ) -> str:
         """Determine pre-assembly FSM state from current environment state."""
         device = ee_pos.device
+        ################################################################################################################
+        # GET CURRENT ROBOT AND ENVIRONMENT STATE
+        ################################################################################################################
         ee_pose = C.to_homogeneous(ee_pos, C.quat2mat(ee_quat))
         body_pose_robot, body_pose_april = self._get_body_pose_robot(
             rb_states, part_idxs, sim_to_april_mat, april_to_robot
         )
+
+        ################################################################################################################
+        # SHARED TARGETS AND CONDITIONS
+        # lo() returns zeros when non_markovian=False (latent_offsets is never populated),
+        # so these booleans are correct for both the NM and Markovian paths.
+        ################################################################################################################
+        grasp_target = self._get_grasp_target(body_pose_april, april_to_robot, ee_pos, device)
         push_target = self._get_push_target(
             rb_states, part_idxs, sim_to_april_mat, april_to_robot, ee_pose, device, body_pose_robot
         )
 
+        # Latent offsets for the current state used by Non-Markovian policy
+        lo_t = torch.tensor(self._lo(), dtype=ee_pos.dtype, device=device)  # zeros when non-NM
+        lo_xy, lo_z = lo_t[:2], float(lo_t[2])
+
         gripper_open_thr = config["robot"]["max_gripper_width"]["square_table"] - 0.005
+        gripper_closed_thr = self.body_grip_width + 0.005
 
-        push_xy = push_target[:2, 3]
-        at_push_xy = (ee_pos[:2] - push_xy).abs().sum() < self.pos_error_threshold * 3
-
+        gripper_open = gripper_width >= gripper_open_thr
+        gripper_closed = gripper_width <= gripper_closed_thr
+        at_grasp_xy = (ee_pos[:2] - (grasp_target[:2, 3] + lo_xy)).abs().sum() < self.pos_error_threshold * 4
+        at_body_z = abs(ee_pos[2] - (body_pose_robot[2, 3] + lo_z)) < self.pos_error_threshold * 2
+        at_push_xy = (ee_pos[:2] - (push_target[:2, 3] + lo_xy)).abs().sum() < self.pos_error_threshold * 3
+        z_high = ee_pos[2] >= 0.09 + lo_z
         # Whether the table body has been physically pushed near the push target.
         # This prevents "done"/"go_up" from firing at episode start when the EE happens
         # to start near push_xy (gripper open, EE high) before any push has occurred.
-        body_near_push_xy = (body_pose_robot[:2, 3] - push_xy).abs().sum() < 0.1
+        body_near_push = (body_pose_robot[:2, 3] - push_target[:2, 3]).abs().sum() < 0.1
 
+        ################################################################################################################
+        # NON-MARKOVIAN: sequential — only check whether _last_state has been completed
+        ################################################################################################################
+        if self.non_markovian:
+            state_sequence = [
+                "reach_body_grasp_xy",
+                "reach_body_grasp_z",
+                "pick_body",
+                "push",
+                "release",
+                "go_up",
+                "done",
+            ]
+            current = self._last_state
+            nxt = state_sequence[state_sequence.index(current) + 1] if current != "done" else "done"
+
+            if current == "reach_body_grasp_xy" and at_grasp_xy:
+                return nxt
+            elif current == "reach_body_grasp_z" and at_body_z:
+                return nxt
+            elif current == "pick_body" and gripper_closed:
+                return nxt
+            elif current == "push" and at_push_xy:
+                return nxt
+            elif current == "release" and gripper_open:
+                return nxt
+            elif current == "go_up" and z_high:
+                return nxt
+            return current
+
+        ################################################################################################################
+        # MARKOVIAN: hierarchical — FSM state determined entirely from current environment state
+        ################################################################################################################
         if at_push_xy:
-            if gripper_width >= gripper_open_thr:
+            if gripper_open:
                 # Gripper open at push target: done/go_up only if table was actually pushed.
-                if body_near_push_xy:
-                    if ee_pos[2] >= 0.09:
+                if body_near_push:
+                    if z_high:
                         return "done"
                     return "go_up"
                 # Gripper open but table not pushed yet → episode-start false positive;
@@ -186,24 +257,15 @@ class TableTop(Part):
                 # Gripper not fully open at push target → open gripper to release table.
                 return "release"
 
-        grasp_target = self._get_grasp_target(body_pose_april, april_to_robot, ee_pos, device)
-        grasp_xy = grasp_target[:2, 3]
-
         # "push": gripper fully closed — table body is grasped, move to push target.
-        # Do NOT require EE to have already moved away from grasp_xy: right after pick_body
-        # succeeds, EE is still at grasp_xy but the correct next action is already "push".
-        if gripper_width <= self.body_grip_width + 0.005:
+        if gripper_closed:
             return "push"
-
-        # "pick_body": EE at body Z, gripper closing (not yet fully closed)
-        body_z = body_pose_robot[2, 3]
-        if abs(ee_pos[2] - body_z) < self.pos_error_threshold * 2:
+        # "pick_body": EE at body Z, gripper closing but not closed yet
+        if at_body_z:
             return "pick_body"
-
         # "reach_body_grasp_z": EE at body XY, needs to descend to body Z
-        if (ee_pos[:2] - grasp_xy).abs().sum() < self.pos_error_threshold * 4:
+        if at_grasp_xy:
             return "reach_body_grasp_z"
-
         return "reach_body_grasp_xy"
 
     def pre_assemble(
