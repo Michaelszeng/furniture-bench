@@ -13,36 +13,46 @@ from furniture_bench.utils.pose import get_mat, is_similar_rot, is_similar_xz, r
 
 
 class Leg(Part):
-    # ── Non-Markovian feature toggles (active only when --non-markovian is set) ──
-    _NM_PAUSE_EXCLUDED_STATES: frozenset = frozenset({"release", "lift_up", "reach_leg_floor_xy", "reach_leg_floor_z"})
-
-    # ── Per-state noise tiers ──────────────────────────────────────────────────
-    # Target-noise tiers (used by apply_non_markovian_config for latent offsets)
-    _LOW_LATENT_TARGET_STD_STATES: frozenset = frozenset(
-        {"reach_leg_floor_z", "pick_leg", "reach_table_top_xy", "pre_screw"}
-    )
-    _ZERO_LATENT_TARGET_STD_STATES: frozenset = frozenset(
-        {"screw_grasp", "screw", "insert_release", "reach_table_top_z"}
-    )
-    # Action-noise tiers (used by furniture_sim_env when computing the executed action).
-    _LOW_ACTION_NOISE_STATES: frozenset = frozenset({"reach_table_top_z", "pre_screw", "screw_grasp", "screw"})
-    _NO_ACTION_NOISE_STATES: frozenset = frozenset({"insert_release"})
-    # States where the noisy (executed) action is also recorded as the clean action.
-    _CLEAN_ACTION_NOISE_STATES: frozenset = frozenset({"reach_table_top_z"})
-
-    # Ry angle (radians) that pitches the EE toward the floor during the floor pick-up.
-    # Adjust here to change the grasp tilt; used identically in compute_state and fsm_step.
-    _GRASP_MARGIN_ANGLE: float = -np.pi / 7
-    _INSERT_TIP_RY_ANGLE: float = np.radians(4.5)  # slight y-axis tilt during table-top approach and insertion
-    _LEG_TIP_OFFSET: float = 0.05625  # distance from leg mesh origin to screw tip (m)
-    _LEG_HOLE_OFFSET_X: float = 0.0025  # fine-alignment offset of tip to table hole, X (m)
-    _LEG_HOLE_OFFSET_Y: float = 0.001  # fine-alignment offset of tip to table hole, Y (m)
-    _PICK_X_OFFSET: float = 0.005  # grab 0.5 cm toward the "top" of the leg along X
-    _PICK_Z_OFFSET: float = 0.012  # EE hovers 1.2 cm above the leg COM during floor pick
-    _ORI_Z_CLEARANCE: float = 0.05  # extra Z clearance during orientation alignment
-
     def __init__(self, part_config, part_idx):
         super().__init__(part_config, part_idx)
+
+        # ── Non-Markovian feature toggles (active only when --non-markovian is set) ──
+        self._NM_PAUSE_EXCLUDED_STATES: frozenset = frozenset(
+            {"release", "lift_up", "reach_leg_floor_xy", "reach_leg_floor_z"}
+        )
+
+        # ── Per-state noise tiers ──────────────────────────────────────────────────
+        # Target-noise tiers (used by apply_non_markovian_config for latent offsets)
+        self._LOW_LATENT_TARGET_STD_STATES: frozenset = frozenset(
+            {"reach_leg_floor_z", "pick_leg", "reach_table_top_xy", "pre_screw", "release"}
+        )
+        self._LOW_LATENT_TARGET_Z_STD_STATES: frozenset = frozenset(
+            {"reach_leg_ori", "reach_leg_floor_z", "pick_leg", "lift_up", "reach_table_top_xy", "pre_screw", "release"}
+        )
+        self._ZERO_LATENT_TARGET_POS_STD_STATES: frozenset = frozenset(
+            {"screw_grasp", "screw", "insert_release", "reach_table_top_z"}
+        )
+        self._ZERO_LATENT_TARGET_ORI_STD_STATES: frozenset = frozenset(
+            {"pre_screw", "screw_grasp", "screw", "insert_release", "reach_table_top_z"}
+        )
+
+        # Action-noise tiers (used by furniture_sim_env when computing the executed action).
+        self._LOW_ACTION_NOISE_STATES: frozenset = frozenset({"reach_table_top_z", "pre_screw", "screw_grasp", "screw"})
+        self._NO_ACTION_NOISE_STATES: frozenset = frozenset({"insert_release"})
+        # States where the noisy (executed) action is also recorded as the clean action.
+        self._CLEAN_ACTION_NOISE_STATES: frozenset = frozenset({"reach_table_top_z"})
+
+        # Ry angle (radians) that pitches the EE toward the floor during the floor pick-up.
+        # Adjust here to change the grasp tilt; used identically in compute_state and fsm_step.
+        self._GRASP_MARGIN_ANGLE: float = -np.pi / 7
+        self._INSERT_TIP_RY_ANGLE: float = np.radians(4.5)  # slight y-axis tilt during table-top approach and insertion
+        self._LEG_TIP_OFFSET: float = 0.05625  # distance from leg mesh origin to screw tip (m)
+        self._LEG_HOLE_OFFSET_X: float = 0.0025  # fine-alignment offset of tip to table hole, X (m)
+        self._LEG_HOLE_OFFSET_Y: float = 0.001  # fine-alignment offset of tip to table hole, Y (m)
+        self._PICK_X_OFFSET: float = 0.005  # grab 0.5 cm toward the "top" of the leg along X
+        self._PICK_Z_OFFSET: float = 0.012  # EE hovers 1.2 cm above the leg COM during floor pick
+        self._ORI_Z_CLEARANCE: float = 0.08 if self.non_markovian else 0.05  # Z clearance during orientation alignment
+
         tag_ids = part_config["ids"]
 
         self.rel_pose_from_center[tag_ids[0]] = get_mat([0, 0, -self.tag_offset], [0, 0, 0])
@@ -69,6 +79,12 @@ class Leg(Part):
         self.GOT_STUCK = False
         self.prev_leg_tip_z_rel = float("inf")
         self.prev_leg_z_vel_robot = float("inf")
+        self.nm_leg_tip_z_rel_history = []  # ring buffer for NM stuck detection
+        self.NM_RETREATING_FROM_INSERTION_FAIL = False  # held True until leg retracts to approach height after a stuck
+        # Shared floor-pick cache: leg_pose_down in the april frame, captured on first entry to
+        # reach_leg_floor_xy and reused through reach_leg_ori, reach_leg_floor_z, and pick_leg.
+        # Prevents the target from drifting if EE contact nudges the leg during approach.
+        self.nm_floor_pick_cached_leg_pose_down = None
         self.gripper_action = -1
 
     def apply_non_markovian_config(self):
@@ -76,8 +92,8 @@ class Leg(Part):
         if not self._NM_LATENT_PLAN:
             return
 
-        HIGH_STD = 0.020  # m — persistent position offset for coarse-motion states
-        LOW_STD = 0.003  # m — persistent position offset for precision states
+        HIGH_STD = 0.016  # m — persistent position offset for coarse-motion states
+        LOW_STD = 0.005  # m — persistent position offset for precision states
         HIGH_ORI_STD = np.radians(5.0)  # rad — persistent orientation offset for coarse-motion states
         LOW_ORI_STD = np.radians(2.0)  # rad — persistent orientation offset for precision states
 
@@ -99,14 +115,21 @@ class Leg(Part):
         ]
 
         def pos_std_for(state):
-            if state in self._ZERO_LATENT_TARGET_STD_STATES:
-                return 0.0
-            if state in self._LOW_LATENT_TARGET_STD_STATES:
-                return LOW_STD
-            return HIGH_STD
+            """Return a (3,) array of per-axis position stds [x, y, z].
+
+            XY and Z axes are controlled independently:
+              XY: ZERO_POS → 0, LOW → LOW_STD, else HIGH_STD
+              Z:  ZERO_POS → 0, LOW_Z → LOW_STD, else HIGH_STD
+            A state can appear in both LOW and LOW_Z to get LOW_STD on all axes.
+            """
+            if state in self._ZERO_LATENT_TARGET_POS_STD_STATES:
+                return np.zeros(3)
+            xy_std = LOW_STD if state in self._LOW_LATENT_TARGET_STD_STATES else HIGH_STD
+            z_std = LOW_STD if state in self._LOW_LATENT_TARGET_Z_STD_STATES else HIGH_STD
+            return np.array([xy_std, xy_std, z_std])
 
         def ori_std_for(state):
-            if state in self._ZERO_LATENT_TARGET_STD_STATES:
+            if state in self._ZERO_LATENT_TARGET_ORI_STD_STATES:
                 return 0.0
             if state in self._LOW_LATENT_TARGET_STD_STATES:
                 return LOW_ORI_STD
@@ -114,7 +137,7 @@ class Leg(Part):
 
         self.latent_offsets = {
             state: {
-                "pos": np.random.normal(0, pos_std_for(state), size=(3,)),
+                "pos": np.random.normal(0, pos_std_for(state)),  # per-axis std via broadcast
                 "ori": np.random.normal(0, ori_std_for(state), size=(3,)),
             }
             for state in all_states
@@ -210,25 +233,9 @@ class Leg(Part):
         pick_target_xy[0] += self._PICK_X_OFFSET
         pick_target_z = leg_z + self._PICK_Z_OFFSET
 
-        # Top-level phase discriminators
-        # Use leg tip (screw threads) rather than COM for the XY proximity check.
-        # Tip is LEG_TIP_OFFSET m in the -local-Y direction from the mesh origin.
         _leg_tip_xy = leg_pose_robot[:2, 3] - leg_pose_robot[:2, 1] * self._LEG_TIP_OFFSET
-        leg_xy_near_hole = torch.norm(_leg_tip_xy - table_hole_pos_robot[:2]) < 0.009
-        leg_xy_near_hole_loose = torch.norm(_leg_tip_xy - table_hole_pos_robot[:2]) < 0.015
 
-        # gripper_grasped: leg is physically between the fingers.
-        # When the leg (diameter = 2*half_width) is held, physics prevents the gripper
-        # from closing below 2*half_width, so the reading stays near that value.
-        # Two-sided bound:
-        #   upper: gripper hasn't opened past the leg (not released)
-        #   lower: gripper isn't empty-closed (width ≈ 0 when nothing is held)
-        # A 0.005 m upper margin and 0.010 m lower margin accommodate measurement noise.
         _leg_diameter = 2 * self.half_width
-        gripper_grasped = (
-            gripper_width < _leg_diameter + 0.0055  # not open
-            and gripper_width > _leg_diameter - 0.010  # not empty-closed
-        )
 
         # Precompute orientations
         _margin = C.rot_mat_tensor(0, self._GRASP_MARGIN_ANGLE, 0, device)
@@ -274,28 +281,56 @@ class Leg(Part):
         pre_screw_target_pos = table_hole_pos_robot[:3].clone()
         pre_screw_target_pos[2] = insert_target_z
 
-        at_pre_screw_target_pos = (ee_pos - (pre_screw_target_pos)).abs().sum() < self.pos_error_threshold * 3
-        at_pre_screw_target_ori = (ee_pose[:3, :3] - pre_screw_target_ori).abs().sum() < self.ori_error_threshold * 1.5
-
         # Staging position during "match_leg_ori" and before "reach_table_top_xy"
         self.staging_pos = torch.tensor([0.45, 0.15, 0.14], device=device)
 
         ################################################################################################################
         # SHARED CONDITIONS
-        # _lo() returns zeros when non_markovian=False (latent_offsets is never populated),
-        # so these booleans are correct for both the NM and Markovian paths.
+        # lo_t uses _last_state's latent offset; _lo() returns zeros when non_markovian=False
+        # (latent_offsets is never populated), so all booleans below are correct for both paths.
         ################################################################################################################
-        # EE orientation checks (used across multiple GRASPED sub-phases)
-        ee_at_insert_ori = (ee_pose[:3, :3] - insert_target_ori).abs().sum() < self.ori_error_threshold * 3
-        # Loose bound: used to decide when the EE has sufficiently rotated to proceed toward the hole.
-        ee_at_insert_ori_loose = (ee_pose[:3, :3] - insert_target_ori).abs().sum() <= self.ori_error_threshold * 4
-        screw_done = (ee_pose[:3, :3] - screw_target_ori).abs().sum() < self.ori_error_threshold * 1.5
+        lo_t = torch.tensor(self._lo(), dtype=ee_pos.dtype, device=device)
+
+        # ON_FLOOR floor-pick approach conditions (lo_t shifts targets to match the latent-offset target tracked in fsm_step)
+        at_pick_xy = (ee_pos[:2] - (pick_target_xy + lo_t[:2])).abs().sum() < self.pos_error_threshold * 3
+        # Gate on orientation alignment between EE and leg.
+        # Randomized gate to get some grasp angle variation.
+        at_grasp_ori_floor = (ee_pose[:3, :3] - grasp_target_ori).abs().sum() < self.ori_error_threshold * 3
+        at_pick_z = abs(ee_pos[2] - (pick_target_z + lo_t[2])) < self.pos_error_threshold
+
+        # gripper_grasped: leg is physically between the fingers.
+        # When the leg (diameter = 2*half_width) is held, physics prevents the gripper
+        # from closing below 2*half_width, so the reading stays near that value.
+        # Two-sided bound:
+        #   upper: gripper hasn't opened past the leg (not released)
+        #   lower: gripper isn't empty-closed (width ≈ 0 when nothing is held)
+        # A 0.005 m upper margin and 0.010 m lower margin accommodate measurement noise.
+        _leg_diameter = 2 * self.half_width
+        gripper_grasped = (
+            gripper_width < _leg_diameter + 0.0055  # not open
+            and gripper_width > _leg_diameter - 0.010  # not empty-closed
+        )
 
         # Transport sub-phase: leg is clear of the floor after lift_up.
         leg_lifted = leg_pose_robot[2, 3] > 0.05
         # For safety, "match_leg_ori" is only returned when EE is still near the staging position;
         # once the EE has flown far toward the hole, we should not come back to match_leg_ori.
         near_staging = (ee_pos[:2] - self.staging_pos[:2]).abs().sum() < 0.2
+
+        # Top-level phase discriminators
+        # Use leg tip (screw threads) rather than COM for the XY proximity check.
+        # Tip is LEG_TIP_OFFSET m in the -local-Y direction from the mesh origin.
+        if self.non_markovian:
+            leg_xy_near_hole = torch.norm(_leg_tip_xy - table_hole_pos_robot[:2]) < 0.015  # looser for NM
+            leg_xy_near_hole_loose = torch.norm(_leg_tip_xy - table_hole_pos_robot[:2]) < 0.020
+        else:
+            leg_xy_near_hole = torch.norm(_leg_tip_xy - table_hole_pos_robot[:2]) < 0.009
+            leg_xy_near_hole_loose = torch.norm(_leg_tip_xy - table_hole_pos_robot[:2]) < 0.015
+
+        # EE orientation checks (used across multiple GRASPED sub-phases)
+        ee_at_insert_ori = (ee_pose[:3, :3] - insert_target_ori).abs().sum() < self.ori_error_threshold * 3
+        # Loose bound: used to decide when the EE has sufficiently rotated to proceed toward the hole.
+        ee_at_insert_ori_loose = (ee_pose[:3, :3] - insert_target_ori).abs().sum() <= self.ori_error_threshold * 4
 
         # Sometimes, due to action noise, leg_xy_near_hole may become untrue momentarily.
         # If the leg is still close to the hole and the robot is moving downward, we know we're probably still in
@@ -308,17 +343,108 @@ class Leg(Part):
         leg_tip_z_rel = leg_z_rel - leg_pose_robot[2, 1] * self._LEG_TIP_OFFSET
         leg_fully_inserted_z = leg_tip_z_rel < 0.057 - self._LEG_TIP_OFFSET  # tip has cleared the hole threshold
 
-        # ON_FLOOR floor-pick approach conditions
-        at_pick_xy = (ee_pos[:2] - pick_target_xy).abs().sum() < self.pos_error_threshold * 3
-        # Gate on orientation alignment between EE and leg.
-        # Randomized gate to get some grasp angle variation.
-        at_grasp_ori_floor = (ee_pose[:3, :3] - grasp_target_ori).abs().sum() < self.ori_error_threshold * 3
-        at_pick_z = abs(ee_pos[2] - pick_target_z) < self.pos_error_threshold
+        # INSERTED phase: EE at pre-screw position and orientation
+        at_pre_screw_target_pos = (ee_pos - (pre_screw_target_pos + lo_t)).abs().sum() < self.pos_error_threshold * 3
+        at_pre_screw_target_ori = (ee_pose[:3, :3] - pre_screw_target_ori).abs().sum() < self.ori_error_threshold * 1.5
+
+        screw_done = (ee_pose[:3, :3] - screw_target_ori).abs().sum() < self.ori_error_threshold * 1.5
+
+        # Insertion stuck detection — runs whenever the EE is in the insertion sub-phase (grasped, near hole,
+        # at insert_ori).  Updates prev_ state variables and sets self.GOT_STUCK; does not return.
+        # `stuck_this_step` is a LOCAL flag: True only when stuck fires on THIS step.
+        # Both the NM and Markovian blocks use stuck_this_step (not self.GOT_STUCK) for the retry transition,
+        # so the robot can re-enter reach_table_top_z on the very next step after being redirected.
+        # self.GOT_STUCK remains True persistently for fsm_step noise handling.
+        STUCK_Z_LOW = 0.01475  # Below this → leg is inserted; don't trigger stuck
+        STUCK_Z_HIGH = 0.01675  # Above this → leg hasn't made progress into the hole
+        stuck_this_step = False
+        if gripper_grasped and leg_xy_near_hole and ee_at_insert_ori:
+            print(f"leg_tip_z_rel: {leg_tip_z_rel}, leg_z_vel_robot: {leg_z_vel_robot}")
+            if self.non_markovian:
+                # NM: declare stuck only after leg_tip_z_rel has stayed in the stuck zone for enough
+                # consecutive steps — more robust than the 2-step Markovian check.
+                NM_STUCK_Z_TIMESTEPS_THRESH = 6
+                if STUCK_Z_LOW < leg_tip_z_rel < STUCK_Z_HIGH:
+                    self.nm_leg_tip_z_rel_history.append(leg_tip_z_rel)
+                else:
+                    self.nm_leg_tip_z_rel_history = []  # reset if leg leaves the stuck zone
+                if len(self.nm_leg_tip_z_rel_history) >= NM_STUCK_Z_TIMESTEPS_THRESH:
+                    self.GOT_STUCK = True
+                    stuck_this_step = True
+                    self.NM_RETREATING_FROM_INSERTION_FAIL = True  # hold in reach_table_top_xy until retracted
+                    self.nm_leg_tip_z_rel_history = []  # reset so it doesn't fire every step
+                    print("GOT_STUCK (NM) -- returning to reach_table_top_xy")
+            else:
+                STUCK_Z_VEL_THRESHOLD = 0.025  # m/s — leg moving upward indicates it is trying the retry behavior
+                # 2-step check: require that both the current and previous step are in the stuck zone
+                z_range_stuck = leg_tip_z_rel < STUCK_Z_HIGH and self.prev_leg_tip_z_rel < STUCK_Z_HIGH
+                self.prev_leg_tip_z_rel = leg_tip_z_rel
+                z_vel_stuck = (
+                    leg_z_vel_robot > STUCK_Z_VEL_THRESHOLD
+                )  # If robot is already moving upward, i.e. already backing out for retry, then continue doing so
+                if (
+                    leg_tip_z_rel > STUCK_Z_LOW  # Don't trigger stuck if leg is inserted
+                    and leg_z_vel_robot > -0.05  # Leg is not moving downward
+                    and self.prev_leg_z_vel_robot > -0.05  # Leg was not moving downward in the previous step
+                    and (z_range_stuck or z_vel_stuck)
+                ):
+                    self.GOT_STUCK = True
+                    stuck_this_step = True
+                    print("GOT_STUCK -- returning to reach_table_top_xy")
+                self.prev_leg_z_vel_robot = leg_z_vel_robot
+        else:
+            # Not in insertion sub-phase — reset Markovian 2-step history so stale values don't persist.
+            self.prev_leg_tip_z_rel = float("inf")
+            self.prev_leg_z_vel_robot = float("inf")
+            self.nm_leg_tip_z_rel_history = []
 
         ################################################################################################################
-        # NON-MARKOVIAN: sequential state machine
+        # NON-MARKOVIAN: sequential state machine — only check whether _last_state has been completed
         ################################################################################################################
-        # TODO
+        if self.non_markovian:
+            current = self._last_state
+            # Gripper fully open threshold (matches insert_release / release gripper_greater() target)
+            gripper_open = gripper_width >= config["robot"]["max_gripper_width"]["square_table"] - 0.001
+
+            if current == "reach_leg_floor_xy" and at_pick_xy:
+                return "reach_leg_ori"
+            elif current == "reach_leg_ori" and at_grasp_ori_floor:
+                return "reach_leg_floor_z"
+            elif current == "reach_leg_floor_z" and at_pick_z:
+                return "pick_leg"
+            elif current == "pick_leg" and gripper_grasped:
+                return "lift_up"
+            elif current == "lift_up" and leg_lifted:
+                return "match_leg_ori"
+            elif current == "match_leg_ori" and ee_at_insert_ori_loose:
+                return "reach_table_top_xy"
+            elif current == "reach_table_top_xy":
+                # After a stuck retry, hold in this state until the leg has retracted to the approach
+                # height — prevents immediately diving back into the hole before the robot has moved.
+                # reach_table_top_xy targets leg_tip_z_rel ≈ 0.14; use 0.10 as a conservative clear threshold.
+                NM_RETRACT_CLEAR_Z = 0.10
+                if self.NM_RETREATING_FROM_INSERTION_FAIL:
+                    if leg_tip_z_rel > NM_RETRACT_CLEAR_Z:
+                        self.NM_RETREATING_FROM_INSERTION_FAIL = False
+                        print("NM retraction complete — ready to re-approach")
+                elif leg_xy_near_hole:
+                    return "reach_table_top_z"
+            elif current == "reach_table_top_z":
+                if leg_fully_inserted_z:
+                    return "insert_release"
+                if stuck_this_step:
+                    return "reach_table_top_xy"  # missed hole; retry approach
+            elif current == "insert_release" and gripper_open:
+                return "pre_screw"
+            elif current == "pre_screw" and at_pre_screw_target_ori and at_pre_screw_target_pos:
+                return "screw_grasp"
+            elif current == "screw_grasp" and gripper_grasped:
+                return "screw"
+            elif current == "screw" and screw_done:
+                return "release"
+            elif current == "release" and gripper_open:
+                return "pre_screw"  # loops for each screw cycle
+            return current
 
         ################################################################################################################
         # MARKOVIAN: FSM state determined entirely via environment state
@@ -335,37 +461,11 @@ class Leg(Part):
                 if ee_at_insert_ori:
                     # ── Insertion sub-phase ──────────────────────────────────
                     # EE is at insert_ori, descending to insert the leg.
+                    # Stuck detection and prev_* updates already ran in the SHARED CONDITIONS block above.
                     if leg_fully_inserted_z:  # tip has cleared the hole threshold → release the leg
                         return "insert_release"
-
-                    # Detect stuck: leg is in the insertion zone but tip XY is off-center from the hole.
-                    # Tunable thresholds:
-                    STUCK_Z_LOW = 0.01475  # Below this means the leg is inserted
-                    STUCK_Z_HIGH = 0.01675  # upper bound of stuck zone (leg hasn't made progress)
-                    STUCK_Z_VEL_THRESHOLD = 0.025  # m/s — leg moving upward indicates it is trying the retry behavior
-                    # 2-markovian -- check that previous state also stuck
-                    z_range_stuck = leg_tip_z_rel < STUCK_Z_HIGH and self.prev_leg_tip_z_rel < STUCK_Z_HIGH
-                    self.prev_leg_tip_z_rel = leg_tip_z_rel  # This is the last time leg_tip_z_rel is used in this func.
-                    z_vel_stuck = (
-                        leg_z_vel_robot > STUCK_Z_VEL_THRESHOLD
-                    )  # If robot is already moving upward, i.e. already backing out for retry, then continue doing so
-                    print(f"leg_tip_z_rel: {leg_tip_z_rel}, leg_z_vel_robot: {leg_z_vel_robot}")
-                    if (
-                        leg_tip_z_rel > STUCK_Z_LOW  # Don't trigger stuck if leg is inserted
-                        and leg_z_vel_robot > -0.05  # Leg is not moving downward
-                        and self.prev_leg_z_vel_robot > -0.05  # Leg was not moving downward in the previous step
-                        and (z_range_stuck or z_vel_stuck)
-                    ):
-                        self.GOT_STUCK = True
-                        # return "back_out_for_retry"
-                        print("GOT_STUCK -- returning to reach_table_top_xy")
-                        self.prev_leg_z_vel_robot = (
-                            leg_z_vel_robot  # This is the last time leg_z_vel_robot is used in this func.
-                        )
-                        return "reach_table_top_xy"
-                    self.prev_leg_z_vel_robot = (
-                        leg_z_vel_robot  # This is the last time leg_z_vel_robot is used in this func.
-                    )
+                    if stuck_this_step:
+                        return "reach_table_top_xy"  # missed hole; retry approach
                     return "reach_table_top_z"  # descending to insert the leg
 
                 else:
@@ -493,6 +593,11 @@ class Leg(Part):
         # Reset timeout window as soon as a new state is entered, before action code runs.
         if state != self._last_state:
             self.prev_cnt = self.curr_cnt
+            # Re-entering reach_leg_floor_xy means the leg was dropped and may have moved;
+            # clear the cache so the new leg position is captured on the first step.
+            # Also clear when leaving pick_leg (sequence complete).
+            if state == "reach_leg_floor_xy" or self._last_state == "pick_leg":
+                self.nm_floor_pick_cached_leg_pose_down = None
 
         # Throttled state print (every 10 steps)
         if self.curr_cnt % 10 == 0:
@@ -548,7 +653,12 @@ class Leg(Part):
         )
 
         if state == "reach_leg_floor_xy":
-            leg_pose_down = self._find_down_z(leg_pose).clone().to(device)
+            if self.non_markovian:
+                if self.nm_floor_pick_cached_leg_pose_down is None:
+                    self.nm_floor_pick_cached_leg_pose_down = self._find_down_z(leg_pose).clone().to(device)
+                leg_pose_down = self.nm_floor_pick_cached_leg_pose_down
+            else:
+                leg_pose_down = self._find_down_z(leg_pose).clone().to(device)
             pos = leg_pose_down[:4, 3]
             target_pos = (april_to_robot @ pos)[:3]
             # Compute the full grasp orientation (yaw-matched to leg) to extract its
@@ -580,7 +690,12 @@ class Leg(Part):
             if result == "TIMEOUT":
                 timeout_failure = True
         elif state == "reach_leg_ori":
-            leg_pose_down = self._find_down_z(leg_pose).clone().to(device)
+            if self.non_markovian:
+                if self.nm_floor_pick_cached_leg_pose_down is None:
+                    self.nm_floor_pick_cached_leg_pose_down = self._find_down_z(leg_pose).clone().to(device)
+                leg_pose_down = self.nm_floor_pick_cached_leg_pose_down
+            else:
+                leg_pose_down = self._find_down_z(leg_pose).clone().to(device)
             target_ori = floor_grasp_ori(leg_pose_down)
             leg_pos_robot = (april_to_robot @ leg_pose_down[:4, 3])[:3]
             target_pos = leg_pos_robot.clone()
@@ -590,7 +705,12 @@ class Leg(Part):
             clean_target = self._apply_latent_offset(state, clean_target)
             if self.non_markovian:
                 target = self._add_noise_to_target(
-                    clean_target, pos_std=0.01, ori_std_deg=2.5, step_noise_pos_std=0.01, step_noise_ori_std_deg=2.5
+                    clean_target,
+                    pos_std=0.01,
+                    ori_std_deg=2.5,
+                    step_noise_pos_std=0.01,
+                    step_noise_pos_std_z=0.004,
+                    step_noise_ori_std_deg=2.5,
                 )
             else:
                 target = self._add_noise_to_target(clean_target, pos_std=0.01, ori_std_deg=5)
@@ -598,7 +718,12 @@ class Leg(Part):
             if result == "TIMEOUT":
                 timeout_failure = True
         elif state == "reach_leg_floor_z":
-            leg_pose_down = self._find_down_z(leg_pose).clone().to(device)
+            if self.non_markovian:
+                if self.nm_floor_pick_cached_leg_pose_down is None:
+                    self.nm_floor_pick_cached_leg_pose_down = self._find_down_z(leg_pose).clone().to(device)
+                leg_pose_down = self.nm_floor_pick_cached_leg_pose_down
+            else:
+                leg_pose_down = self._find_down_z(leg_pose).clone().to(device)
             target_ori = floor_grasp_ori(leg_pose_down)
             leg_pos_robot = (april_to_robot @ leg_pose_down[:4, 3])[:3]  # leg COM in the robot frame
             target_pos = leg_pos_robot.clone()
@@ -607,13 +732,23 @@ class Leg(Part):
             clean_target = C.to_homogeneous(target_pos, target_ori)
             clean_target = self._apply_latent_offset(state, clean_target)
             target = self._add_noise_to_target(
-                clean_target, pos_std=0.01, ori_std_deg=12.0, step_noise_pos_std=0.005, step_noise_ori_std_deg=2.0
+                clean_target,
+                pos_std=0.01,
+                ori_std_deg=12.0,
+                step_noise_pos_std=0.005,
+                step_noise_pos_std_z=0.001,
+                step_noise_ori_std_deg=2.0,
             )
             result = self.satisfy(ee_pose, target, pos_error_threshold=0.015, ori_error_threshold=0.3, max_len=30)
             if result == "TIMEOUT":
                 timeout_failure = True
         elif state == "pick_leg":
-            leg_pose_down = self._find_down_z(leg_pose).clone().to(device)
+            if self.non_markovian:
+                if self.nm_floor_pick_cached_leg_pose_down is None:
+                    self.nm_floor_pick_cached_leg_pose_down = self._find_down_z(leg_pose).clone().to(device)
+                leg_pose_down = self.nm_floor_pick_cached_leg_pose_down
+            else:
+                leg_pose_down = self._find_down_z(leg_pose).clone().to(device)
             target_ori = floor_grasp_ori(leg_pose_down)
             leg_pos_robot = (april_to_robot @ leg_pose_down[:4, 3])[:3]  # leg COM in the robot frame
             target_pos = leg_pos_robot.clone()
@@ -795,7 +930,7 @@ class Leg(Part):
                 timeout_failure = True
         elif state == "pre_screw":
             target_pos = (april_to_robot @ leg_pose)[:3, 3].clone()
-            target_pos[2] = 0.055 if not self._NM_STEP_NOISE else 0.061  # A little higher if there is target step noise
+            target_pos[2] = 0.055 if not self.non_markovian else 0.061  # A little higher if there is target step noise
 
             ee_z_dot_down = -ee_pose[2, 2]  # 1.0 = EE Z-axis straight down
             ee_x_dot_world_x = ee_pose[0, 0]  # X-component of EE local-X (world frame)

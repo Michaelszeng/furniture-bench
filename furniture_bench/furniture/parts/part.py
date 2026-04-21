@@ -372,9 +372,7 @@ class Part(ABC):
                 ori_vec = offset["ori"]
                 if np.any(ori_vec):
                     quat = C.mat2quat(clean_target[:3, :3])
-                    delta = torch.tensor(
-                        T.axisangle2quat(ori_vec.tolist()), device=device, dtype=clean_target.dtype
-                    )
+                    delta = torch.tensor(T.axisangle2quat(ori_vec.tolist()), device=device, dtype=clean_target.dtype)
                     clean_target[:3, :3] = C.quat2mat(C.quat_multiply(quat, delta))
         return clean_target
 

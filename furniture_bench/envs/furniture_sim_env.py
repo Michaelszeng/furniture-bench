@@ -1595,6 +1595,10 @@ class FurnitureSimEnv(gym.Env):
                 all_noisy.append(hold)
                 all_clean.append(hold)
                 all_skill.append(0)
+                print(
+                    f"[green][ENV {env_idx}][/green] PAUSING -- non-markovian pause "
+                    f"remaining={self._nm_pause_remaining[env_idx]}"
+                )
                 continue
             # ─────────────────────────────────────────────────────────────────────────
 

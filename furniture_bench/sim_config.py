@@ -25,6 +25,12 @@ sim_config["scripted_timeout"] = {
     "stool": 1_000,  # Increased from 1300
 }
 
+# Non-Markovian timeouts — longer to accommodate latent-offset detours and stuck retries.
+# Falls back to scripted_timeout for tasks not listed here.
+sim_config["nm_scripted_timeout"] = {
+    "one_leg": 800,
+}
+
 # Simulator options.
 sim_params = gymapi.SimParams()
 sim_params.up_axis = gymapi.UP_AXIS_Z

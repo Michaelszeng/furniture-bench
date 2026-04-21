@@ -30,7 +30,7 @@ class TableTop(Part):
         self.gripper_action = -1
         self.body_grip_width = 0.01
         # Fractional offset along the grasped side: 0.0 = center, 0.5 = 3/4 from one end.
-        self.grasp_side_offset_frac = -0.25
+        self.grasp_side_offset_frac = -0.19 if self.non_markovian else -0.25  # Closer to center for NM
 
         self.skill_complete_next_states = [
             "push",
@@ -326,7 +326,7 @@ class TableTop(Part):
                 target = self._add_noise_to_target(
                     clean_target,
                     pos_std=0.005,  # slightly larger noise for Z approach (original: [0.01, 0.01, 0.001])
-                    step_noise_pos_std=0.006,
+                    step_noise_pos_std=0.004,
                     step_noise_ori_std_deg=3.0,
                 )
             else:
@@ -347,7 +347,7 @@ class TableTop(Part):
             clean_target = self._apply_latent_offset(state, clean_target)
             if self.non_markovian:
                 target = self._add_noise_to_target(
-                    clean_target, pos_std=0.003, ori_std_deg=3.0, step_noise_pos_std=0.003, step_noise_ori_std_deg=3.0
+                    clean_target, pos_std=0.003, ori_std_deg=3.0, step_noise_pos_std=0.002, step_noise_ori_std_deg=2.0
                 )
             else:
                 target = self._add_noise_to_target(clean_target, pos_std=0.003, ori_std_deg=3.0)
