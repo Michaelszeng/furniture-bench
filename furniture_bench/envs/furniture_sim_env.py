@@ -1758,9 +1758,9 @@ class FurnitureSimEnv(gym.Env):
                         "aa": np.zeros(3),
                     }
                 cs = self._corr_noise_state[key]
-                pos_std = 0.005 * _action_noise_scale * self.dart_amount
+                pos_std = 0.003 * _action_noise_scale
                 cs["pos"] = alpha * cs["pos"] + scale * torch.normal(torch.zeros(3, device=self.device), pos_std)
-                aa_std = np.radians(5 * _action_noise_scale * self.dart_amount)
+                aa_std = np.radians(3 * _action_noise_scale)
                 cs["aa"] = alpha * cs["aa"] + scale * np.random.normal(0, aa_std, size=(3,))
                 corr_quat = torch.tensor(T.axisangle2quat(cs["aa"].tolist()), device=self.device)
                 delta_pos = delta_pos + cs["pos"]

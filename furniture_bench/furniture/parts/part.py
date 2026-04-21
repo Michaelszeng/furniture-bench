@@ -264,66 +264,68 @@ class Part(ABC):
     ):
         """Add noise to TARGET.
 
-        Step noise (persistent, probabilistically switched) and i.i.d. per-step noise are accumulated
-        into a single combined vector before clipping and application.
+        Step noise (persistent expert variation) is applied in-place to the input `target`
+        so that callers' clean_target automatically includes it. i.i.d. per-step jitter is
+        DART noise and is only applied to the returned clone.
 
         Args:
-            pos_std / pos_std_z / ori_std_deg: i.i.d. per-step noise stds (position in m, orientation in deg).
-            pos_max / ori_max_deg: clip the COMBINED (step + i.i.d.) noise to [-x, x].
-            step_noise_pos_std / step_noise_pos_std_z / step_noise_ori_std_deg: persistent step-noise stds;
-                each component is multiplied by self.dart_amount. Default 0 = no step noise.
+            pos_std / pos_std_z / ori_std_deg: i.i.d. per-step DART noise stds (position in m, orientation in deg).
+            pos_max / ori_max_deg: clip the i.i.d. noise to [-x, x].
+            step_noise_pos_std / step_noise_pos_std_z / step_noise_ori_std_deg: persistent expert step-noise stds;
+                NOT scaled by dart_amount. Default 0 = no step noise.
         """
         if self.no_noise:
             return target
 
-        noisy = target.clone()
         device = target.device
-        total_pos_noise = torch.zeros(3, dtype=target.dtype, device=device)
-        total_ori_noise = np.zeros(3)
 
-        # NM step noise: persistent offset that switches probabilistically each step.
+        # NM step noise: persistent expert offset applied in-place to `target` (= clean_target in callers).
+        # Not scaled by dart_amount — this noise is part of the expert and is recorded in clean actions.
         if self.non_markovian and self._NM_STEP_NOISE and (step_noise_pos_std > 0.0 or step_noise_ori_std_deg > 0.0):
             state = self._last_state
             if state not in self._step_noise or np.random.random() < self._NM_STEP_NOISE_SWITCH_PROB:
-                sp = step_noise_pos_std * self.dart_amount
-                sz = (
-                    step_noise_pos_std_z if step_noise_pos_std_z is not None else step_noise_pos_std
-                ) * self.dart_amount
-                so = np.radians(step_noise_ori_std_deg * self.dart_amount)
+                sp = step_noise_pos_std
+                sz = step_noise_pos_std_z if step_noise_pos_std_z is not None else step_noise_pos_std
+                so = np.radians(step_noise_ori_std_deg)
                 self._step_noise[state] = {
                     "pos": np.random.normal(0, [sp, sp, sz]),
                     "ori": np.random.normal(0, so, size=3),
                 }
             step = self._step_noise[state]
-            total_pos_noise += torch.tensor(step["pos"], dtype=target.dtype, device=device)
-            total_ori_noise += step["ori"]
+            target[:3, 3] += torch.tensor(step["pos"], dtype=target.dtype, device=device)
+            if step["ori"].any():
+                ori = C.mat2quat(target[:3, :3]).to(device)
+                ori = C.quat_multiply(
+                    ori,
+                    torch.tensor(T.axisangle2quat(step["ori"].tolist()), device=device),
+                ).to(device)
+                target[:3, :3] = C.quat2mat(ori)
 
-        # i.i.d. per-step jitter.
+        # Clone after step noise; i.i.d. DART noise is applied only to the clone (not recorded in clean actions).
+        noisy = target.clone()
+
         if not self.no_iid_target_noise and not self.current_state_no_noise():
             scaled_pos_std = pos_std * self.dart_amount
             scaled_pos_std_z = (pos_std_z if pos_std_z is not None else pos_std) * self.dart_amount
             iid_pos = torch.normal(
                 mean=torch.zeros(3),
                 std=torch.tensor([scaled_pos_std, scaled_pos_std, scaled_pos_std_z], dtype=torch.float32),
-            )
-            total_pos_noise += iid_pos.to(device)
-            scaled_ori_std_rad = np.radians(ori_std_deg * self.dart_amount)
-            total_ori_noise += np.random.normal(0, scaled_ori_std_rad, size=3)
-
-        # Apply combined noise, clipping first if requested.
-        if pos_max is not None:
-            total_pos_noise = total_pos_noise.clamp(-pos_max, pos_max)
-        noisy[:3, 3] += total_pos_noise
-
-        if total_ori_noise.any():
-            if ori_max_deg is not None:
-                total_ori_noise = np.clip(total_ori_noise, -np.radians(ori_max_deg), np.radians(ori_max_deg))
-            ori = C.mat2quat(noisy[:3, :3]).to(device)
-            ori = C.quat_multiply(
-                ori,
-                torch.tensor(T.axisangle2quat(total_ori_noise.tolist()), device=device),
             ).to(device)
-            noisy[:3, :3] = C.quat2mat(ori)
+            if pos_max is not None:
+                iid_pos = iid_pos.clamp(-pos_max, pos_max)
+            noisy[:3, 3] += iid_pos
+
+            scaled_ori_std_rad = np.radians(ori_std_deg * self.dart_amount)
+            iid_ori = np.random.normal(0, scaled_ori_std_rad, size=3)
+            if ori_max_deg is not None:
+                iid_ori = np.clip(iid_ori, -np.radians(ori_max_deg), np.radians(ori_max_deg))
+            if iid_ori.any():
+                ori = C.mat2quat(noisy[:3, :3]).to(device)
+                ori = C.quat_multiply(
+                    ori,
+                    torch.tensor(T.axisangle2quat(iid_ori.tolist()), device=device),
+                ).to(device)
+                noisy[:3, :3] = C.quat2mat(ori)
 
         return noisy
 
