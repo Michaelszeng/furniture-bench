@@ -15,7 +15,7 @@ from furniture_bench.utils.pose import get_mat, is_similar_pos, is_similar_pose,
 
 
 class Part(ABC):
-    _NM_LATENT_PLAN: bool = True  # episode-level fixed position offsets per state
+    _NM_LATENT_PLAN: bool = False  # episode-level fixed position offsets per state
     _NM_STEP_NOISE: bool = False  # per-step persistent target-noise; stds passed per call to _add_noise_to_target()
     _NM_PAUSES: bool = False  # inject random-length hold at each FSM state transition
 

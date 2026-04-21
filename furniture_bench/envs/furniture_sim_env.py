@@ -57,7 +57,7 @@ _ENABLE_TARGET_NOISE: bool = False
 # Action noise: i.i.d. Gaussian on delta_pos and orientation
 _ENABLE_ACTION_NOISE: bool = False
 # Temporally correlated (OU) action noise (non-Markovian only); independent of i.i.d. noise
-_ENABLE_CORR_ACTION_NOISE: bool = False
+_ENABLE_CORR_ACTION_NOISE: bool = True
 # OU smoothing factor: τ = 1/(1-alpha) steps.  0.97 → τ≈33 steps (~3 s at 10 Hz).
 _CORR_NOISE_ALPHA: float = 0.95
 
@@ -1718,8 +1718,6 @@ class FurnitureSimEnv(gym.Env):
             clean_delta_quat = C.quat_mul(C.quat_conjugate(ee_quat), clean_goal_ori)
             clean_delta_quat = C.quat_slerp(identity_quat, clean_delta_quat, self.delta_quat_gain)
 
-            clean_action = torch.concat([clean_delta_pos, clean_delta_quat, gripper])
-
             # Noise scale shared by both i.i.d. and corr noise blocks.
             _current_state_no_noise = self.furnitures[env_idx].parts[part_idx2].current_state_no_noise()
             _low_noise = self.furnitures[env_idx].parts[part_idx2].current_state_low_action_noise()
@@ -1746,7 +1744,8 @@ class FurnitureSimEnv(gym.Env):
                     torch.tensor(T.axisangle2quat(aa_noise), device=self.device),
                 ).to(self.device)
 
-            # Temporally correlated (OU) noise — independent of i.i.d. noise above.
+            # Temporally correlated (OU) noise — applied to both executed and recorded action.
+            # i.i.d. action noise above is NOT recorded; corr noise IS recorded.
             # Update rule (variance-preserving): z_t = alpha·z_{t-1} + √(1-alpha²)·ε_t
             # alpha=0 → pure i.i.d.; alpha→1 → slow drift with τ = 1/(1-alpha) steps.
             if _ENABLE_CORR_ACTION_NOISE and not self.no_noise and not _current_state_no_noise and self.non_markovian:
@@ -1761,24 +1760,16 @@ class FurnitureSimEnv(gym.Env):
                 cs = self._corr_noise_state[key]
                 pos_std = 0.005 * _action_noise_scale * self.dart_amount
                 cs["pos"] = alpha * cs["pos"] + scale * torch.normal(torch.zeros(3, device=self.device), pos_std)
-                delta_pos = delta_pos + cs["pos"]
                 aa_std = np.radians(5 * _action_noise_scale * self.dart_amount)
                 cs["aa"] = alpha * cs["aa"] + scale * np.random.normal(0, aa_std, size=(3,))
-                delta_quat = C.quat_multiply(
-                    delta_quat,
-                    torch.tensor(T.axisangle2quat(cs["aa"].tolist()), device=self.device),
-                ).to(self.device)
+                corr_quat = torch.tensor(T.axisangle2quat(cs["aa"].tolist()), device=self.device)
+                delta_pos = delta_pos + cs["pos"]
+                delta_quat = C.quat_multiply(delta_quat, corr_quat).to(self.device)
+                clean_delta_pos = clean_delta_pos + cs["pos"]
+                clean_delta_quat = C.quat_multiply(clean_delta_quat, corr_quat).to(self.device)
 
             noisy_action = torch.concat([delta_pos, delta_quat, gripper])
-
-            # For states that opt in, record the noisy action as the clean action
-            # so both target noise and action noise are reflected in the dataset.
-            if (
-                _ENABLE_ACTION_NOISE
-                and not self.no_noise
-                and self.furnitures[env_idx].parts[part_idx2].current_state_clean_action_noise()
-            ):
-                clean_action = noisy_action
+            clean_action = torch.concat([clean_delta_pos, clean_delta_quat, gripper])
 
             all_noisy.append(noisy_action)
             all_clean.append(clean_action)
