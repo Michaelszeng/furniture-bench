@@ -20,9 +20,9 @@ class TableTop(Part):
     # NOTE: these do not affect the random per-step target noise in _add_noise_to_target(), only affect the latent
     # plan offsets and step noise stds.
     _LOW_LATENT_TARGET_STD_STATES: frozenset = frozenset(
-        {"reach_body_grasp_z", "push", "pick_body", "release", "go_up", "done"}
+        {"reach_body_grasp_z", "pick_body", "release", "go_up", "done"}
     )
-    _ZERO_LATENT_TARGET_STD_STATES: frozenset = frozenset({})
+    _ZERO_LATENT_TARGET_STD_STATES: frozenset = frozenset({"push"})
 
     def __init__(self, part_config: dict, part_idx: int):
         super().__init__(part_config, part_idx)
@@ -30,7 +30,7 @@ class TableTop(Part):
         self.gripper_action = -1
         self.body_grip_width = 0.01
         # Fractional offset along the grasped side: 0.0 = center, 0.5 = 3/4 from one end.
-        self.grasp_side_offset_frac = -0.19 if self.non_markovian else -0.25  # Closer to center for NM
+        self.grasp_side_offset_frac = -0.18 if self.non_markovian else -0.25  # Closer to center for NM
 
         self.skill_complete_next_states = [
             "push",

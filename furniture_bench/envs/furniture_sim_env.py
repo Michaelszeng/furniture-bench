@@ -53,9 +53,9 @@ ASSET_ROOT = str(Path(__file__).parent.parent.absolute() / "assets")
 # ---------------------------------------------------------------------------
 # Target noise: (1) FSM per-step goal-pose jitter via _add_noise_to_target() [main jitter source];
 #               (2) randomised kick multiplier and XY speed limit in _compute_delta_pos.
-_ENABLE_TARGET_NOISE: bool = False
+_ENABLE_TARGET_NOISE: bool = True
 # Action noise: i.i.d. Gaussian on delta_pos and orientation
-_ENABLE_ACTION_NOISE: bool = False
+_ENABLE_ACTION_NOISE: bool = True
 # Temporally correlated (OU) action noise (non-Markovian only); independent of i.i.d. noise
 _ENABLE_CORR_ACTION_NOISE: bool = True
 # OU smoothing factor: τ = 1/(1-alpha) steps.  0.97 → τ≈33 steps (~3 s at 10 Hz).
@@ -1681,6 +1681,18 @@ class FurnitureSimEnv(gym.Env):
                     if active_part._last_state not in active_part._NM_PAUSE_EXCLUDED_STATES:
                         self._nm_pause_remaining[env_idx] = int(np.random.randint(0, active_part._NM_MAX_PAUSE + 1))
                         self._nm_pause_gripper[env_idx] = float(gripper[0].item())
+                # Step-noise pauses: pause before and/or after a step-noise switch.
+                if active_part._nm_sn_pre_pause_steps > 0:  # Pre-step pause
+                    pause = active_part._nm_sn_pre_pause_steps
+                    active_part._nm_sn_pre_pause_steps = 0
+                    self._nm_pause_remaining[env_idx] = max(self._nm_pause_remaining[env_idx], pause)
+                    self._nm_pause_gripper[env_idx] = float(gripper[0].item())
+                if active_part._nm_sn_post_pause_pending:  # Post-step pause
+                    active_part._nm_sn_post_pause_pending = False
+                    self._nm_pause_remaining[env_idx] = max(
+                        self._nm_pause_remaining[env_idx], active_part._nm_sn_post_pause_steps
+                    )
+                    self._nm_pause_gripper[env_idx] = float(gripper[0].item())
             # ─────────────────────────────────────────────────────────────────────────
 
             # Per-env gains (set before _compute_delta_pos which reads self.delta_pos_gain).

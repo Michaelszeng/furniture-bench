@@ -24,16 +24,23 @@ class Leg(Part):
         # ── Per-state noise tiers ──────────────────────────────────────────────────
         # Target-noise tiers (used by apply_non_markovian_config for latent offsets)
         self._LOW_LATENT_TARGET_STD_STATES: frozenset = frozenset(
-            {"reach_leg_floor_z", "pick_leg", "reach_table_top_xy", "pre_screw", "release"}
+            {"reach_leg_floor_z", "pick_leg", "reach_table_top_xy", "reach_table_top_z", "pre_screw", "release"}
         )
         self._LOW_LATENT_TARGET_Z_STD_STATES: frozenset = frozenset(
-            {"reach_leg_ori", "reach_leg_floor_z", "pick_leg", "lift_up", "reach_table_top_xy", "pre_screw", "release"}
+            {
+                "pick_leg",
+                "lift_up",
+                "reach_table_top_xy",
+                "reach_table_top_z",
+                "pre_screw",
+                "release",
+            }
         )
         self._ZERO_LATENT_TARGET_POS_STD_STATES: frozenset = frozenset(
-            {"screw_grasp", "screw", "insert_release", "reach_table_top_z"}
+            {"reach_leg_ori", "reach_leg_floor_z", "screw_grasp", "screw", "insert_release", "reach_table_top_z"}
         )
         self._ZERO_LATENT_TARGET_ORI_STD_STATES: frozenset = frozenset(
-            {"pre_screw", "screw_grasp", "screw", "insert_release", "reach_table_top_z"}
+            {"reach_leg_ori", "pre_screw", "screw_grasp", "screw", "insert_release", "reach_table_top_z"}
         )
 
         # Action-noise tiers (used by furniture_sim_env when computing the executed action).
@@ -41,6 +48,26 @@ class Leg(Part):
         self._NO_ACTION_NOISE_STATES: frozenset = frozenset({"insert_release"})
         # States where the noisy (executed) action is also recorded as the clean action.
         self._CLEAN_ACTION_NOISE_STATES: frozenset = frozenset({"reach_table_top_z"})
+
+        # ── NM screw-grasp alignment cycles ──────────────────────────────────────
+        # Before closing the gripper, the EE makes 1..MAX_CYCLES random target shifts
+        # (mimicking a human repositioning to align) followed by one final clean cycle.
+        self._NM_SCREW_GRASP_MAX_ALIGN_CYCLES: int = 3  # max random cycles (final clean cycle is always added)
+        self._NM_SCREW_GRASP_ALIGN_STEPS_MIN: int = 3  # min steps per cycle
+        self._NM_SCREW_GRASP_ALIGN_STEPS_MAX: int = 9  # max steps per cycle
+        self._NM_SCREW_GRASP_ALIGN_POS_STD: float = 0.012  # std of random XY offset (m)
+
+        self._NM_PICK_LEG_MAX_ALIGN_CYCLES: int = 3
+        self._NM_PICK_LEG_ALIGN_STEPS_MIN: int = 2
+        self._NM_PICK_LEG_ALIGN_STEPS_MAX: int = 10
+        self._NM_PICK_LEG_ALIGN_POS_STD: float = 0.01
+
+        # ── NM insertion descent pauses ───────────────────────────────────────────
+        # During reach_table_top_z, the robot may randomly pause its descent to mimic
+        # a human double-checking alignment before committing to insertion.
+        self._NM_INSERTION_PAUSE_PROB: float = 0.2  # per-step probability of starting a pause
+        self._NM_INSERTION_PAUSE_STEPS_MIN: int = 3
+        self._NM_INSERTION_PAUSE_STEPS_MAX: int = 8
 
         # Ry angle (radians) that pitches the EE toward the floor during the floor pick-up.
         # Adjust here to change the grasp tilt; used identically in compute_state and fsm_step.
@@ -51,7 +78,7 @@ class Leg(Part):
         self._LEG_HOLE_OFFSET_Y: float = 0.001  # fine-alignment offset of tip to table hole, Y (m)
         self._PICK_X_OFFSET: float = 0.005  # grab 0.5 cm toward the "top" of the leg along X
         self._PICK_Z_OFFSET: float = 0.012  # EE hovers 1.2 cm above the leg COM during floor pick
-        self._ORI_Z_CLEARANCE: float = 0.08 if self.non_markovian else 0.05  # Z clearance during orientation alignment
+        self._ORI_Z_CLEARANCE: float = 0.13 if self.non_markovian else 0.05  # Z clearance during orientation alignment
 
         tag_ids = part_config["ids"]
 
@@ -85,6 +112,23 @@ class Leg(Part):
         # reach_leg_floor_xy and reused through reach_leg_ori, reach_leg_floor_z, and pick_leg.
         # Prevents the target from drifting if EE contact nudges the leg during approach.
         self.nm_floor_pick_cached_leg_pose_down = None
+        # Cached EE z at the start of reach_leg_floor_xy. Used as the fixed base for the z-target
+        # so the latent z offset doesn't compound each step (EE chasing its own drifting position).
+        self.nm_reach_leg_floor_xy_cached_ee_z: float | None = None
+        # Screw-grasp alignment state (NM only).
+        self.nm_screw_grasp_align_cycles_remaining = None  # None = uninitialised
+        self.nm_screw_grasp_align_done = False
+        self.nm_screw_grasp_align_step_end = 0
+        self.nm_screw_grasp_align_offset = None
+        # Pick-leg alignment state (NM only).
+        self.nm_pick_leg_align_cycles_remaining = None
+        self.nm_pick_leg_align_done = False
+        self.nm_pick_leg_align_step_end = 0
+        self.nm_pick_leg_align_offset = None
+        # Insertion descent pause state (NM only).
+        self.nm_insertion_pause_step_end: int = 0
+        self.nm_insertion_pause_cached_z: float = 0.0
+        self.leg_tip_z_rel: float = float("inf")  # set each step by compute_state
         self.gripper_action = -1
 
     def apply_non_markovian_config(self):
@@ -338,10 +382,10 @@ class Leg(Part):
         barely_missed_hole = leg_xy_near_hole_loose and leg_z_vel_robot < -0.06 and ee_at_insert_ori
 
         # Insertion depth: leg tip Z relative to table surface (in robot frame).
-        # Computed unconditionally so it can be used in both the NM and Markovian paths.
         leg_z_rel = leg_pose_robot[2, 3] - table_pose_robot[2, 3]
         leg_tip_z_rel = leg_z_rel - leg_pose_robot[2, 1] * self._LEG_TIP_OFFSET
-        leg_fully_inserted_z = leg_tip_z_rel < 0.057 - self._LEG_TIP_OFFSET  # tip has cleared the hole threshold
+        self.leg_tip_z_rel = leg_tip_z_rel
+        leg_fully_inserted_z = leg_tip_z_rel < 0.05725 - self._LEG_TIP_OFFSET  # tip has cleared the hole threshold
 
         # INSERTED phase: EE at pre-screw position and orientation
         at_pre_screw_target_pos = (ee_pos - (pre_screw_target_pos + lo_t)).abs().sum() < self.pos_error_threshold * 3
@@ -356,7 +400,7 @@ class Leg(Part):
         # so the robot can re-enter reach_table_top_z on the very next step after being redirected.
         # self.GOT_STUCK remains True persistently for fsm_step noise handling.
         STUCK_Z_LOW = 0.01475  # Below this → leg is inserted; don't trigger stuck
-        STUCK_Z_HIGH = 0.01675  # Above this → leg hasn't made progress into the hole
+        STUCK_Z_HIGH = 0.01725 if self.non_markovian else 0.01675  # Above this → leg hasn't made progress into the hole
         stuck_this_step = False
         if gripper_grasped and leg_xy_near_hole and ee_at_insert_ori:
             print(f"leg_tip_z_rel: {leg_tip_z_rel}, leg_z_vel_robot: {leg_z_vel_robot}")
@@ -422,7 +466,10 @@ class Leg(Part):
                 # After a stuck retry, hold in this state until the leg has retracted to the approach
                 # height — prevents immediately diving back into the hole before the robot has moved.
                 # reach_table_top_xy targets leg_tip_z_rel ≈ 0.14; use 0.10 as a conservative clear threshold.
-                NM_RETRACT_CLEAR_Z = 0.10
+                NM_RETRACT_CLEAR_Z = 0.055
+                print(
+                    f"NM_RETREATING_FROM_INSERTION_FAIL: {self.NM_RETREATING_FROM_INSERTION_FAIL}; leg_tip_z_rel > NM_RETRACT_CLEAR_Z: {leg_tip_z_rel > NM_RETRACT_CLEAR_Z}; leg_tip_z_rel: {leg_tip_z_rel}"
+                )
                 if self.NM_RETREATING_FROM_INSERTION_FAIL:
                     if leg_tip_z_rel > NM_RETRACT_CLEAR_Z:
                         self.NM_RETREATING_FROM_INSERTION_FAIL = False
@@ -598,6 +645,16 @@ class Leg(Part):
             # Also clear when leaving pick_leg (sequence complete).
             if state == "reach_leg_floor_xy" or self._last_state == "pick_leg":
                 self.nm_floor_pick_cached_leg_pose_down = None
+                self.nm_reach_leg_floor_xy_cached_ee_z = None
+            # Reset alignment state whenever we (re-)enter the relevant states.
+            if state == "screw_grasp":
+                self.nm_screw_grasp_align_cycles_remaining = None
+                self.nm_screw_grasp_align_done = False
+            if state == "pick_leg":
+                self.nm_pick_leg_align_cycles_remaining = None
+                self.nm_pick_leg_align_done = False
+            if state == "reach_table_top_z":
+                self.nm_insertion_pause_step_end = 0
 
         # Throttled state print (every 10 steps)
         if self.curr_cnt % 10 == 0:
@@ -676,7 +733,9 @@ class Leg(Part):
             R_z_delta[1, 1] = c
             target_ori = R_z_delta @ ee_pose[:3, :3]
             target_pos[0] + self._PICK_X_OFFSET
-            target_pos[2] = ee_pos[2]
+            if self.nm_reach_leg_floor_xy_cached_ee_z is None:
+                self.nm_reach_leg_floor_xy_cached_ee_z = ee_pos[2].item()
+            target_pos[2] = self.nm_reach_leg_floor_xy_cached_ee_z
             clean_target = C.to_homogeneous(target_pos, target_ori)
             clean_target = self._apply_latent_offset(state, clean_target)
             if self.non_markovian:
@@ -707,10 +766,10 @@ class Leg(Part):
                 target = self._add_noise_to_target(
                     clean_target,
                     pos_std=0.01,
-                    ori_std_deg=2.5,
+                    ori_std_deg=2.0,
                     step_noise_pos_std=0.01,
                     step_noise_pos_std_z=0.004,
-                    step_noise_ori_std_deg=2.5,
+                    step_noise_ori_std_deg=0.5,
                 )
             else:
                 target = self._add_noise_to_target(clean_target, pos_std=0.01, ori_std_deg=5)
@@ -731,14 +790,17 @@ class Leg(Part):
             target_pos[2] = leg_pos_robot[2] + self._PICK_Z_OFFSET
             clean_target = C.to_homogeneous(target_pos, target_ori)
             clean_target = self._apply_latent_offset(state, clean_target)
-            target = self._add_noise_to_target(
-                clean_target,
-                pos_std=0.01,
-                ori_std_deg=12.0,
-                step_noise_pos_std=0.005,
-                step_noise_pos_std_z=0.001,
-                step_noise_ori_std_deg=2.0,
-            )
+            if self.non_markovian:
+                target = self._add_noise_to_target(
+                    clean_target,
+                    pos_std=0.005,
+                    ori_std_deg=2.5,
+                    step_noise_pos_std=0.01,
+                    step_noise_pos_std_z=0.004,
+                    step_noise_ori_std_deg=2.5,
+                )
+            else:
+                target = self._add_noise_to_target(clean_target, pos_std=0.01, ori_std_deg=12.0)
             result = self.satisfy(ee_pose, target, pos_error_threshold=0.015, ori_error_threshold=0.3, max_len=30)
             if result == "TIMEOUT":
                 timeout_failure = True
@@ -754,22 +816,68 @@ class Leg(Part):
             target_pos = leg_pos_robot.clone()
             target_pos[0] = leg_pos_robot[0] + self._PICK_X_OFFSET
             target_pos[2] = leg_pos_robot[2] + self._PICK_Z_OFFSET
-            clean_target = C.to_homogeneous(target_pos, target_ori)
-            clean_target = self._apply_latent_offset(state, clean_target)
+
             if self.non_markovian:
+                # Alignment phase: 1..MAX_ALIGN_CYCLES random XY shifts followed by one
+                # clean cycle, then close the gripper.  Mimics a human repositioning before picking.
+                def new_cycle(random_offset):
+                    xy = np.random.normal(0, self._NM_PICK_LEG_ALIGN_POS_STD, size=2) if random_offset else (0.0, 0.0)
+                    self.nm_pick_leg_align_offset = torch.tensor([*xy, 0.0], dtype=target_pos.dtype, device=device)
+                    self.nm_pick_leg_align_step_end = self.curr_cnt + np.random.randint(
+                        self._NM_PICK_LEG_ALIGN_STEPS_MIN, self._NM_PICK_LEG_ALIGN_STEPS_MAX + 1
+                    )
+
+                if self.nm_pick_leg_align_cycles_remaining is None:
+                    self.nm_pick_leg_align_cycles_remaining = np.random.randint(
+                        1, self._NM_PICK_LEG_MAX_ALIGN_CYCLES + 1
+                    )
+                    new_cycle(random_offset=True)
+                    # curr_cnt is incremented at the bottom of this step (state_transition_handler),
+                    # so step_end must be shifted +1 so the first cycle lasts the full randint steps
+                    # after the NM transition pause, not randint-1.
+                    self.nm_pick_leg_align_step_end += 1
+
+                if not self.nm_pick_leg_align_done and self.curr_cnt >= self.nm_pick_leg_align_step_end:
+                    self.nm_pick_leg_align_cycles_remaining -= 1
+                    if self.nm_pick_leg_align_cycles_remaining > 0:
+                        new_cycle(random_offset=True)
+                    elif self.nm_pick_leg_align_cycles_remaining == 0:
+                        new_cycle(random_offset=False)  # final clean cycle
+                    else:
+                        self.nm_pick_leg_align_done = True
+
+                pos = target_pos if self.nm_pick_leg_align_done else target_pos + self.nm_pick_leg_align_offset
+                clean_target = C.to_homogeneous(pos, target_ori)
+                clean_target = self._apply_latent_offset(state, clean_target)
                 target = self._add_noise_to_target(
-                    clean_target, pos_std=0.008, ori_std_deg=15.0, step_noise_pos_std=0.002, step_noise_ori_std_deg=2.0
+                    clean_target, pos_std=0.001, ori_std_deg=1.0, step_noise_pos_std=0.0, step_noise_ori_std_deg=1.0
                 )
+                self.gripper_action = 1 if self.nm_pick_leg_align_done else -1
+                if self.nm_pick_leg_align_done:
+                    result = self.gripper_less(gripper_width, 2 * self.half_width + 0.001)
+                    if result == "TIMEOUT":
+                        timeout_failure = True
+                else:
+                    print(
+                        f"[pick_leg NM align] cycles_left={self.nm_pick_leg_align_cycles_remaining}"
+                        f"  offset_xy=({self.nm_pick_leg_align_offset[0]:.4f}, {self.nm_pick_leg_align_offset[1]:.4f})"
+                    )
+            # Markovian
             else:
+                clean_target = C.to_homogeneous(target_pos, target_ori)
+                clean_target = self._apply_latent_offset(state, clean_target)
                 target = self._add_noise_to_target(clean_target, pos_std=0.01, ori_std_deg=15.0)
-            self.gripper_action = 1
-            result = self.gripper_less(gripper_width, 2 * self.half_width + 0.001)
-            if result == "TIMEOUT":
-                timeout_failure = True
+                self.gripper_action = 1
+                result = self.gripper_less(gripper_width, 2 * self.half_width + 0.001)
+                if result == "TIMEOUT":
+                    timeout_failure = True
         elif state == "lift_up":
             leg_pose_down = self._find_down_z(leg_pose).clone().to(device)
             leg_pos_robot = (april_to_robot @ leg_pose_down[:4, 3])[:3]  # leg COM in the robot frame
-            target_pos = leg_pos_robot.clone()
+            if self.non_markovian:
+                target_pos = self.staging_pos
+            else:
+                target_pos = leg_pos_robot.clone()
             target_pos[2] += 0.06
             target_ori = ee_pose[:3, :3]
             clean_target = C.to_homogeneous(target_pos, target_ori)
@@ -816,10 +924,17 @@ class Leg(Part):
             target_leg_tip_pose_robot[:3, :3] = ry3 @ target_leg_tip_pose_robot[:3, :3]  # Apply y-axis rotation
             rel = rel_rot_mat(leg_tip_pose_robot, target_leg_tip_pose_robot)
             clean_target = rel @ ee_pose
-            clean_target = self._apply_latent_offset(state, clean_target)
+            # Skip latent offset on retry: the same episode-level XY bias that caused the miss
+            # would otherwise keep the approach in the same wrong position on every retry.
+            if not self.GOT_STUCK:
+                clean_target = self._apply_latent_offset(state, clean_target)
             if self.non_markovian:
                 target = self._add_noise_to_target(
-                    clean_target, pos_std=0.002, ori_std_deg=0.5, step_noise_pos_std=0.010, step_noise_ori_std_deg=5.0
+                    clean_target,
+                    pos_std=0.002,
+                    ori_std_deg=0.5,
+                    step_noise_pos_std=0.0 if self.GOT_STUCK else 0.010,
+                    step_noise_ori_std_deg=0.0 if self.GOT_STUCK else 5.0,
                 )
             else:
                 target = self._add_noise_to_target(clean_target, pos_std=0.002, ori_std_deg=0.5)
@@ -846,7 +961,29 @@ class Leg(Part):
             target_leg_tip_pose_robot[:3, :3] = ry3 @ target_leg_tip_pose_robot[:3, :3]  # Apply y-axis rotation
             rel = rel_rot_mat(leg_tip_pose_robot, target_leg_tip_pose_robot)
             clean_target = rel @ ee_pose
-            # NOTE: DO NOT _apply_latent_offset() here, since we need precision during insertion
+            # NM descent pause: randomly freeze z-target to mimic human pausing to check alignment.
+            # Only fires when the leg is safely above the hole (leg_tip_z_rel > STUCK_Z_HIGH).
+            if self.non_markovian and not self.GOT_STUCK:
+                STUCK_Z_HIGH = 0.01675
+                if self.nm_insertion_pause_step_end > 0 and self.curr_cnt < self.nm_insertion_pause_step_end:
+                    # Active pause: hold EE at the frozen z so the robot stops descending.
+                    clean_target[2, 3] = self.nm_insertion_pause_cached_z
+                else:
+                    self.nm_insertion_pause_step_end = 0
+                    if (
+                        self.leg_tip_z_rel > STUCK_Z_HIGH
+                        and self.leg_tip_z_rel < STUCK_Z_HIGH + 0.007
+                        and np.random.random() < self._NM_INSERTION_PAUSE_PROB
+                    ):
+                        # Cache the CURRENT EE z (not the fixed destination z) so the robot holds in place.
+                        self.nm_insertion_pause_cached_z = ee_pose[2, 3].item()
+                        self.nm_insertion_pause_step_end = self.curr_cnt + np.random.randint(
+                            self._NM_INSERTION_PAUSE_STEPS_MIN, self._NM_INSERTION_PAUSE_STEPS_MAX + 1
+                        )
+                        clean_target[2, 3] = self.nm_insertion_pause_cached_z
+                        print(
+                            f"[reach_table_top_z NM] pause started for {self.nm_insertion_pause_step_end - self.curr_cnt} steps at z={self.nm_insertion_pause_cached_z:.4f}"
+                        )
             # Don't add as much noise if the leg got stuck
             # Note that this is non-markovian but doesn't make the policy non-markovian,
             # since this only affects the noise added during simulation, doesn't affect the actual recorded actions.
@@ -859,8 +996,8 @@ class Leg(Part):
                         ori_std_deg=2.0,
                         pos_max=0.005,
                         ori_max_deg=4.0,
-                        step_noise_pos_std=0.002,
-                        step_noise_pos_std_z=0.0,
+                        step_noise_pos_std=0.002 if self.leg_tip_z_rel > 0.03 else 0.0,
+                        step_noise_pos_std_z=0.002 if self.leg_tip_z_rel > 0.04 else 0.0,
                         step_noise_ori_std_deg=1.0,
                     )
                 else:
@@ -875,6 +1012,7 @@ class Leg(Part):
                     )
             else:
                 target = self._add_noise_to_target(clean_target, pos_std=0.0, ori_std_deg=0.0)
+            # NOTE: DO NOT _apply_latent_offset() here, since we need precision during insertion
             result = self.satisfy(ee_pose, target, pos_error_threshold=0.007, ori_error_threshold=0.15, max_len=75)
             if result == "TIMEOUT":
                 timeout_failure = True
@@ -956,7 +1094,7 @@ class Leg(Part):
             clean_target = self._apply_latent_offset(state, clean_target)
             if self.non_markovian:
                 target = self._add_noise_to_target(
-                    clean_target, pos_std=0.0, ori_std_deg=0.0, step_noise_pos_std=0.003, step_noise_ori_std_deg=1.0
+                    clean_target, pos_std=0.0, ori_std_deg=0.0, step_noise_pos_std=0.0025, step_noise_ori_std_deg=1.0
                 )
             else:
                 target = self._add_noise_to_target(clean_target, pos_std=0.0, ori_std_deg=0.0)
@@ -966,16 +1104,61 @@ class Leg(Part):
         elif state == "screw_grasp":
             # IMPORTANT: define target relative to leg pose so that we grab it centered
             target_pos = (april_to_robot @ leg_pose)[:3, 3].clone()
-            # target_pos[2] = table_pose_robot[2, 3] + 0.065
             target_pos[2] = 0.055
             target_ori = C.rot_mat_tensor(np.pi, 0, np.pi, device)[:3, :3]
-            clean_target = C.to_homogeneous(target_pos, target_ori)
-            clean_target = self._apply_latent_offset(state, clean_target)
-            target = self._add_noise_to_target(clean_target, pos_std=0.0, ori_std_deg=0.0)  # NO NOISE during grasp
-            self.gripper_action = 1
-            result = self.gripper_less(gripper_width, 2 * self.half_width + 0.001)
-            if result == "TIMEOUT":
-                timeout_failure = True
+
+            if self.non_markovian:
+                # Alignment phase: 1..MAX_ALIGN_CYCLES random target shifts followed by one
+                # clean cycle, then close the gripper.  Mimics a human repositioning before grasping.
+                def new_cycle(random_offset):
+                    xy = (
+                        np.random.normal(0, self._NM_SCREW_GRASP_ALIGN_POS_STD, size=2) if random_offset else (0.0, 0.0)
+                    )
+                    self.nm_screw_grasp_align_offset = torch.tensor([*xy, 0.0], dtype=target_pos.dtype, device=device)
+                    self.nm_screw_grasp_align_step_end = self.curr_cnt + np.random.randint(
+                        self._NM_SCREW_GRASP_ALIGN_STEPS_MIN, self._NM_SCREW_GRASP_ALIGN_STEPS_MAX + 1
+                    )
+
+                if self.nm_screw_grasp_align_cycles_remaining is None:
+                    self.nm_screw_grasp_align_cycles_remaining = np.random.randint(
+                        2, self._NM_SCREW_GRASP_MAX_ALIGN_CYCLES + 1
+                    )
+                    new_cycle(random_offset=True)
+                    # Same +1 correction as pick_leg: curr_cnt increments at end of the
+                    # transition step, so shift step_end to give the full cycle duration after the pause.
+                    self.nm_screw_grasp_align_step_end += 1
+
+                if not self.nm_screw_grasp_align_done and self.curr_cnt >= self.nm_screw_grasp_align_step_end:
+                    self.nm_screw_grasp_align_cycles_remaining -= 1
+                    if self.nm_screw_grasp_align_cycles_remaining > 0:
+                        new_cycle(random_offset=True)
+                    elif self.nm_screw_grasp_align_cycles_remaining == 0:
+                        new_cycle(random_offset=False)  # final clean cycle
+                    else:
+                        self.nm_screw_grasp_align_done = True
+
+                pos = target_pos if self.nm_screw_grasp_align_done else target_pos + self.nm_screw_grasp_align_offset
+                clean_target = C.to_homogeneous(pos, target_ori)
+                clean_target = self._apply_latent_offset(state, clean_target)
+                target = self._add_noise_to_target(clean_target, pos_std=0.0, ori_std_deg=0.0)
+                self.gripper_action = 1 if self.nm_screw_grasp_align_done else -1
+                if self.nm_screw_grasp_align_done:
+                    result = self.gripper_less(gripper_width, 2 * self.half_width + 0.001)
+                    if result == "TIMEOUT":
+                        timeout_failure = True
+                else:
+                    print(
+                        f"[screw_grasp NM align] cycles_left={self.nm_screw_grasp_align_cycles_remaining}"
+                        f"  offset_xy=({self.nm_screw_grasp_align_offset[0]:.4f}, {self.nm_screw_grasp_align_offset[1]:.4f})"
+                    )
+            else:
+                clean_target = C.to_homogeneous(target_pos, target_ori)
+                clean_target = self._apply_latent_offset(state, clean_target)
+                target = self._add_noise_to_target(clean_target, pos_std=0.0, ori_std_deg=0.0)  # NO NOISE during grasp
+                self.gripper_action = 1
+                result = self.gripper_less(gripper_width, 2 * self.half_width + 0.001)
+                if result == "TIMEOUT":
+                    timeout_failure = True
         elif state == "screw":
             # Rotate EE -180° about global Z from pre_screw back to Rx(π).
             # Split into two 90° steps (same technique as pre_screw) to avoid rotational ambiguity.

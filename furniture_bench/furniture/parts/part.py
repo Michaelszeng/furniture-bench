@@ -15,13 +15,16 @@ from furniture_bench.utils.pose import get_mat, is_similar_pos, is_similar_pose,
 
 
 class Part(ABC):
-    _NM_LATENT_PLAN: bool = False  # episode-level fixed position offsets per state
-    _NM_STEP_NOISE: bool = False  # per-step persistent target-noise; stds passed per call to _add_noise_to_target()
-    _NM_PAUSES: bool = False  # inject random-length hold at each FSM state transition
+    _NM_LATENT_PLAN: bool = True  # episode-level fixed position offsets per state
+    _NM_STEP_NOISE: bool = True  # per-step persistent target-noise; stds passed per call to _add_noise_to_target()
+    _NM_PAUSES: bool = True  # inject random-length hold at each FSM state transition
+
+    _NM_STEP_NOISE_PRE_PAUSE_PROB: float = 0.0025  # probability of pre-step pause
+    _NM_STEP_NOISE_POST_PAUSE_PROB: float = 0.0025  # probability of post-step pause
 
     _NM_STEP_NOISE_SWITCH_PROB: float = 0.15  # probability of resampling the step noise each timestep
 
-    _NM_MAX_PAUSE: int = 10  # max pause duration (steps); also added to every satisfy() timeout budget
+    _NM_MAX_PAUSE: int = 6  # max pause duration (steps); also added to every satisfy() timeout budget
     _NM_PAUSE_EXCLUDED_STATES: frozenset = frozenset()  # states where no pause is injected
 
     @abstractmethod
@@ -245,6 +248,7 @@ class Part(ABC):
         if new_state != prev_state:
             print(f"[yellow][FSM][/yellow] {self.name}: {prev_state} -> {new_state}")
             self.prev_cnt = self.curr_cnt
+            self._nm_sn_switch_pending = False  # cancel any deferred step-noise switch
         self.curr_cnt += 1
         self._last_state = new_state
         # Only fire skill_complete on the step we first enter a skill_complete state
@@ -281,25 +285,36 @@ class Part(ABC):
 
         # NM step noise: persistent expert offset applied in-place to `target` (= clean_target in callers).
         # Not scaled by dart_amount — this noise is part of the expert and is recorded in clean actions.
+        # With 50% chance, a pause is inserted before the switch (pre-pause) and/or after (post-pause)
         if self.non_markovian and self._NM_STEP_NOISE and (step_noise_pos_std > 0.0 or step_noise_ori_std_deg > 0.0):
             state = self._last_state
-            if state not in self._step_noise or np.random.random() < self._NM_STEP_NOISE_SWITCH_PROB:
-                sp = step_noise_pos_std
-                sz = step_noise_pos_std_z if step_noise_pos_std_z is not None else step_noise_pos_std
-                so = np.radians(step_noise_ori_std_deg)
-                self._step_noise[state] = {
-                    "pos": np.random.normal(0, [sp, sp, sz]),
-                    "ori": np.random.normal(0, so, size=3),
-                }
-            step = self._step_noise[state]
-            target[:3, 3] += torch.tensor(step["pos"], dtype=target.dtype, device=device)
-            if step["ori"].any():
-                ori = C.mat2quat(target[:3, :3]).to(device)
-                ori = C.quat_multiply(
-                    ori,
-                    torch.tensor(T.axisangle2quat(step["ori"].tolist()), device=device),
-                ).to(device)
-                target[:3, :3] = C.quat2mat(ori)
+            wants_switch = state not in self._step_noise or np.random.random() < self._NM_STEP_NOISE_SWITCH_PROB
+
+            if wants_switch and not self._nm_sn_switch_pending:
+                if np.random.random() < self._NM_STEP_NOISE_PRE_PAUSE_PROB:
+                    # Pre-pause: defer switch; signal env to hold for a few steps first.
+                    self._nm_sn_switch_pending = True
+                    self._nm_sn_pre_pause_steps = int(np.random.randint(0, self._NM_MAX_PAUSE // 2 + 1))
+                else:
+                    # No pre-pause: switch immediately.
+                    self._perform_step_noise_switch(
+                        state, step_noise_pos_std, step_noise_pos_std_z, step_noise_ori_std_deg
+                    )
+            elif self._nm_sn_switch_pending:
+                # Pre-pause complete (env resumed calling fsm_step): perform the deferred switch.
+                self._nm_sn_switch_pending = False
+                self._perform_step_noise_switch(state, step_noise_pos_std, step_noise_pos_std_z, step_noise_ori_std_deg)
+
+            if state in self._step_noise:
+                step = self._step_noise[state]
+                target[:3, 3] += torch.tensor(step["pos"], dtype=target.dtype, device=device)
+                if step["ori"].any():
+                    ori = C.mat2quat(target[:3, :3]).to(device)
+                    ori = C.quat_multiply(
+                        ori,
+                        torch.tensor(T.axisangle2quat(step["ori"].tolist()), device=device),
+                    ).to(device)
+                    target[:3, :3] = C.quat2mat(ori)
 
         # Clone after step noise; i.i.d. DART noise is applied only to the clone (not recorded in clean actions).
         noisy = target.clone()
@@ -329,6 +344,19 @@ class Part(ABC):
 
         return noisy
 
+    def _perform_step_noise_switch(self, state, pos_std, pos_std_z, ori_std_deg):
+        """Sample new step noise for `state` and optionally arm a post-switch pause."""
+        sp = pos_std
+        sz = pos_std_z if pos_std_z is not None else pos_std
+        so = np.radians(ori_std_deg)
+        self._step_noise[state] = {
+            "pos": np.random.normal(0, [sp, sp, sz]),
+            "ori": np.random.normal(0, so, size=3),
+        }
+        if np.random.random() < self._NM_STEP_NOISE_POST_PAUSE_PROB:
+            self._nm_sn_post_pause_pending = True
+            self._nm_sn_post_pause_steps = int(np.random.randint(0, self._NM_MAX_PAUSE // 2 + 1))
+
     def reset(self):
         self.pre_assemble_done = False
         self._last_state = ""
@@ -339,6 +367,10 @@ class Part(ABC):
         # Non-Markovian latent offset (populated by apply_non_markovian_config)
         self.latent_offsets = {}
         self._step_noise = {}
+        self._nm_sn_switch_pending = False  # pre-pause fired; switch deferred until env resumes
+        self._nm_sn_pre_pause_steps = 0  # read by env to arm a pre-switch pause
+        self._nm_sn_post_pause_pending = False  # read by env to arm a post-switch pause
+        self._nm_sn_post_pause_steps = 0
         # Backward-compat reset for non-Markovian parts
         self.first_setting_target = True
         self.target = None

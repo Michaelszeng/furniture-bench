@@ -28,7 +28,7 @@ sim_config["scripted_timeout"] = {
 # Non-Markovian timeouts — longer to accommodate latent-offset detours and stuck retries.
 # Falls back to scripted_timeout for tasks not listed here.
 sim_config["nm_scripted_timeout"] = {
-    "one_leg": 800,
+    "one_leg": 900,
 }
 
 # Simulator options.
