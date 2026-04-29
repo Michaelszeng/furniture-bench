@@ -57,9 +57,26 @@ _ENABLE_TARGET_NOISE: bool = True
 # Action noise: i.i.d. Gaussian on delta_pos and orientation
 _ENABLE_ACTION_NOISE: bool = True
 # Temporally correlated (OU) action noise (non-Markovian only); independent of i.i.d. noise
-_ENABLE_CORR_ACTION_NOISE: bool = True
+# This noise gets rolled out in simulation and also recorded into the "clean actions" into the dataset.
+_ENABLE_CORR_ACTION_NOISE: bool = False
 # OU smoothing factor: τ = 1/(1-alpha) steps.  0.97 → τ≈33 steps (~3 s at 10 Hz).
-_CORR_NOISE_ALPHA: float = 0.95
+_CORR_NOISE_ALPHA: float = 0.75
+
+# ── Non-Markovian virtual-target walk ─────────────────────────────────────────
+# When enabled, the EE is commanded toward a virtual target (VT) that wanders
+# stochastically toward the FSM goal rather than directly chasing it, producing
+# varied human-like approach trajectories.  Parameters match the tuned values in
+# scripts/plot_nm_virtual_target.py.
+_ENABLE_NM_VIRTUAL_TARGET: bool = True
+_NM_VT_ALPHA_POS: float = 0.85  # position velocity momentum (0 = memoryless)
+_NM_VT_K_POS: float = 0.05  # position spring constant toward goal
+_NM_VT_SIGMA_POS: float = 0.005  # position noise std (m) at full distance
+_NM_VT_FALLOFF_FRAC_POS: float = 0.80  # noise ramps off within this fraction of initial dist
+
+_NM_VT_ALPHA_ORI: float = 0.95  # orientation angular-velocity momentum
+_NM_VT_K_ORI: float = 0.15  # orientation spring constant toward goal
+_NM_VT_SIGMA_ORI: float = np.radians(1.0)  # orientation noise std (rad) at full angle error
+_NM_VT_FALLOFF_FRAC_ORI: float = 0.60  # noise ramps off within this fraction of initial angle
 
 
 class FurnitureSimEnv(gym.Env):
@@ -177,8 +194,14 @@ class FurnitureSimEnv(gym.Env):
         self._corr_noise_state = {}  # (env_idx, part_idx) -> {'pos': Tensor(3), 'aa': ndarray(3)}
         # Per-env Non-Markovian pause state (used by get_assembly_action)
         self._nm_pause_remaining = [0] * num_envs  # steps left in current pause
-        self._nm_prev_state_key = [None] * num_envs  # (assemble_idx, part_name, fsm_state) of last FSM call
         self._nm_pause_gripper = [-1.0] * num_envs  # gripper command to hold during pause
+        # Per-env virtual-target walk state (None = uninitialised; reset on FSM state change)
+        self._nm_vt_pos = [None] * num_envs  # np.ndarray[3] current VT position
+        self._nm_vt_vel = [None] * num_envs  # np.ndarray[3] current VT velocity
+        self._nm_vt_ori = [None] * num_envs  # np.ndarray[3,3] current VT orientation
+        self._nm_vt_ang_vel = [None] * num_envs  # np.ndarray[3] current VT angular velocity
+        self._nm_vt_falloff_dist = [1e-8] * num_envs  # fixed at state entry; used for noise scaling
+        self._nm_vt_falloff_angle = [1e-8] * num_envs
         self.dart_amount = dart_amount
         for furn in self.furnitures:
             for part in furn.parts:
@@ -1226,8 +1249,13 @@ class FurnitureSimEnv(gym.Env):
         self.scripted_timeout = [False] * self.num_envs
         self._corr_noise_state = {}
         self._nm_pause_remaining = [0] * self.num_envs
-        self._nm_prev_state_key = [None] * self.num_envs
         self._nm_pause_gripper = [-1.0] * self.num_envs
+        self._nm_vt_pos = [None] * self.num_envs
+        self._nm_vt_vel = [None] * self.num_envs
+        self._nm_vt_ori = [None] * self.num_envs
+        self._nm_vt_ang_vel = [None] * self.num_envs
+        self._nm_vt_falloff_dist = [1e-8] * self.num_envs
+        self._nm_vt_falloff_angle = [1e-8] * self.num_envs
 
         self.refresh()
 
@@ -1273,8 +1301,13 @@ class FurnitureSimEnv(gym.Env):
         self.scripted_timeout[env_idx] = False
         # Clear NM pause state for this env so it doesn't carry over between episodes.
         self._nm_pause_remaining[env_idx] = 0
-        self._nm_prev_state_key[env_idx] = None
         self._nm_pause_gripper[env_idx] = -1.0
+        self._nm_vt_pos[env_idx] = None
+        self._nm_vt_vel[env_idx] = None
+        self._nm_vt_ori[env_idx] = None
+        self._nm_vt_ang_vel[env_idx] = None
+        self._nm_vt_falloff_dist[env_idx] = 1e-8
+        self._nm_vt_falloff_angle[env_idx] = 1e-8
 
     def reset_env_to(self, env_idx, state):
         """Reset to a specific state. **MUST refresh in between multiple calls
@@ -1604,6 +1637,9 @@ class FurnitureSimEnv(gym.Env):
 
             timeout_failure = False
             clean_goal_pos = clean_goal_ori = None
+            active_part = part1 if not part1_pre_assemble_done else part2
+            prev_nm_state = active_part._last_state  # saved before FSM call to detect state transitions
+            active_part.reset_speed()  # restore defaults; fsm_step/pre_assemble may call set_speed() to override
             if not part1_pre_assemble_done:
                 # print(f"[green][ENV {env_idx}][/green] pre-assembling part1={part1.name}")
                 pre_result = part1.pre_assemble(
@@ -1672,22 +1708,18 @@ class FurnitureSimEnv(gym.Env):
                 all_skill.append(0)
                 continue
 
-            # ── Non-Markovian pause: detect state transition, arm pause for next step ─
-            active_part = part1 if not part1_pre_assemble_done else part2
-            if self.non_markovian and active_part._NM_PAUSES:
-                new_key = (assemble_idx, active_part.name, getattr(active_part, "_last_state", None))
-                if new_key != self._nm_prev_state_key[env_idx]:
-                    self._nm_prev_state_key[env_idx] = new_key
-                    if active_part._last_state not in active_part._NM_PAUSE_EXCLUDED_STATES:
-                        self._nm_pause_remaining[env_idx] = int(np.random.randint(0, active_part._NM_MAX_PAUSE + 1))
-                        self._nm_pause_gripper[env_idx] = float(gripper[0].item())
-                # Step-noise pauses: pause before and/or after a step-noise switch.
-                if active_part._nm_sn_pre_pause_steps > 0:  # Pre-step pause
-                    pause = active_part._nm_sn_pre_pause_steps
-                    active_part._nm_sn_pre_pause_steps = 0
-                    self._nm_pause_remaining[env_idx] = max(self._nm_pause_remaining[env_idx], pause)
+            # ── Non-Markovian pause: arm pause when FSM signals a transition or step-noise switch ─
+            if self.non_markovian:
+                # State-transition pause: compute_state/compute_pre_assemble_state sets this flag
+                # explicitly on the transitions where a pause is desired.
+                if active_part._nm_transition_pause_requested:
+                    active_part._nm_transition_pause_requested = False
+                    self._nm_pause_remaining[env_idx] = int(
+                        np.random.randint(active_part._NM_MIN_PAUSE, active_part._NM_MAX_PAUSE + 1)
+                    )
                     self._nm_pause_gripper[env_idx] = float(gripper[0].item())
-                if active_part._nm_sn_post_pause_pending:  # Post-step pause
+                # Step-noise pause: optionally pause after a step-noise switch.
+                if active_part._nm_sn_post_pause_pending:
                     active_part._nm_sn_post_pause_pending = False
                     self._nm_pause_remaining[env_idx] = max(
                         self._nm_pause_remaining[env_idx], active_part._nm_sn_post_pause_steps
@@ -1695,22 +1727,98 @@ class FurnitureSimEnv(gym.Env):
                     self._nm_pause_gripper[env_idx] = float(gripper[0].item())
             # ─────────────────────────────────────────────────────────────────────────
 
-            # Per-env gains (set before _compute_delta_pos which reads self.delta_pos_gain).
-            self.delta_pos_gain = 2.5
-            self.delta_quat_gain = 1.0
-            MAX_DELTA_XY = 0.13
-            MAX_DELTA_Z = 0.07
-            if hasattr(part2, "_last_state"):
-                if part2._last_state == "screw":
-                    self.delta_pos_gain = 4.0
-                    self.delta_quat_gain = 1.0
-                    MAX_DELTA_XY = 0.13
-                    MAX_DELTA_Z = 0.07
-                elif part2._last_state == "reach_table_top_z":
-                    self.delta_pos_gain = 2.5
-                    self.delta_quat_gain = 1.0
-                    MAX_DELTA_XY = 0.13
-                    MAX_DELTA_Z = 0.015
+            # ── Non-Markovian virtual-target walk ─────────────────────────────────────
+            # Replace the FSM goal with a virtual target (VT) that drifts stochastically
+            # toward the true goal using a biased OU process, producing varied approach
+            # trajectories.  Both the noisy and clean actions use the VT position so the
+            # varied path is recorded in the dataset.
+            if self.non_markovian and _ENABLE_NM_VIRTUAL_TARGET:
+                # Reset VT whenever the FSM enters a new state.
+                if active_part._last_state != prev_nm_state:
+                    self._nm_vt_pos[env_idx] = None
+
+                goal_pos_np = goal_pos.cpu().numpy()
+                goal_ori_np = C.quat2mat(goal_ori).cpu().numpy()
+
+                # Lazy-init: place VT at current EE pose on first step of each state.
+                if self._nm_vt_pos[env_idx] is None:
+                    self._nm_vt_pos[env_idx] = ee_pos.cpu().numpy().copy()
+                    self._nm_vt_vel[env_idx] = np.zeros(3)
+                    self._nm_vt_ori[env_idx] = C.quat2mat(ee_quat).cpu().numpy().copy()
+                    self._nm_vt_ang_vel[env_idx] = np.zeros(3)
+                    initial_dist = float(np.linalg.norm(goal_pos_np - self._nm_vt_pos[env_idx]))
+                    self._nm_vt_falloff_dist[env_idx] = max(_NM_VT_FALLOFF_FRAC_POS * initial_dist, 1e-8)
+                    r_to_goal = T.quat2axisangle(T.mat2quat(goal_ori_np @ self._nm_vt_ori[env_idx].T))
+                    initial_angle = float(np.linalg.norm(r_to_goal))
+                    self._nm_vt_falloff_angle[env_idx] = max(_NM_VT_FALLOFF_FRAC_ORI * initial_angle, 1e-8)
+
+                # Per-state noise scale: zero for precision states, half for low-noise states.
+                _rw_state = active_part._last_state
+                if _rw_state in active_part._ZERO_RANDOM_WALK_NOISE_STD_STATES:
+                    _rw_sigma_scale = 0.0
+                elif _rw_state in active_part._LOW_RANDOM_WALK_NOISE_STD_STATES:
+                    _rw_sigma_scale = 0.3
+                else:
+                    _rw_sigma_scale = 1.0
+                # Z-axis noise can be suppressed independently (e.g. during vertical descent states).
+                _rw_sigma_scale_z = (
+                    0.0 if _rw_state in active_part._ZERO_RANDOM_WALK_NOISE_Z_STD_STATES else _rw_sigma_scale
+                )
+                _rw_per_axis_scale = np.array([_rw_sigma_scale, _rw_sigma_scale, _rw_sigma_scale_z])
+
+                # ── Position OU step ──────────────────────────────────────────────────
+                vt_pos = self._nm_vt_pos[env_idx]
+                vt_vel = self._nm_vt_vel[env_idx]
+                to_goal = goal_pos_np - vt_pos
+                dist = float(np.linalg.norm(to_goal))
+                noise_scale = np.clip(dist / self._nm_vt_falloff_dist[env_idx], 0.0, 1.0)
+                vt_vel = (
+                    _NM_VT_ALPHA_POS * vt_vel
+                    + _NM_VT_K_POS * to_goal
+                    + _NM_VT_SIGMA_POS
+                    * noise_scale
+                    * (np.random.randn(3) * np.array([1.0, 1.0, 0.35]) * _rw_per_axis_scale)  # 0.35x z-axis noise vs xy
+                )
+                dist_sq = dist**2
+                if dist_sq > 1e-10:  # project out backward component so VT always converges
+                    backward = float(np.dot(vt_vel, to_goal))
+                    if backward < 0:
+                        vt_vel -= (backward / dist_sq) * to_goal
+                self._nm_vt_pos[env_idx] = vt_pos + vt_vel
+                self._nm_vt_vel[env_idx] = vt_vel
+
+                # ── Orientation OU step ───────────────────────────────────────────────
+                vt_ori = self._nm_vt_ori[env_idx]
+                vt_ang_vel = self._nm_vt_ang_vel[env_idx]
+                r_to_goal = T.quat2axisangle(T.mat2quat(goal_ori_np @ vt_ori.T))
+                angle = float(np.linalg.norm(r_to_goal))
+                scale = np.clip(angle / self._nm_vt_falloff_angle[env_idx], 0.0, 1.0)
+                vt_ang_vel = (
+                    _NM_VT_ALPHA_ORI * scale * vt_ang_vel
+                    + _NM_VT_K_ORI * r_to_goal
+                    + _NM_VT_SIGMA_ORI * scale * _rw_sigma_scale * np.random.randn(3)
+                )
+                angle_sq = angle**2
+                if angle_sq > 1e-10:
+                    backward = float(np.dot(vt_ang_vel, r_to_goal))
+                    if backward < 0:
+                        vt_ang_vel -= (backward / angle_sq) * r_to_goal
+                self._nm_vt_ori[env_idx] = T.quat2mat(T.axisangle2quat(vt_ang_vel)) @ vt_ori
+                self._nm_vt_ang_vel[env_idx] = vt_ang_vel
+
+                # Replace goal with virtual target; both noisy and clean actions follow VT path.
+                goal_pos = torch.tensor(self._nm_vt_pos[env_idx], dtype=goal_pos.dtype, device=self.device)
+                goal_ori = torch.tensor(T.mat2quat(self._nm_vt_ori[env_idx]), dtype=goal_ori.dtype, device=self.device)
+                clean_goal_pos = goal_pos
+                clean_goal_ori = goal_ori
+            # ─────────────────────────────────────────────────────────────────────────
+
+            # Per-env gains: ask the active part for its current-state speed config.
+            _speed = active_part.get_speed_config()
+            self.delta_pos_gain = _speed["delta_pos_gain"]
+            self.delta_quat_gain = _speed["delta_quat_gain"]
+            MAX_DELTA_XY = _speed["max_delta_xy"]
+            MAX_DELTA_Z = _speed["max_delta_z"]
 
             # Compute noisy delta position from (noisy) goal
             delta_pos = self._compute_delta_pos(

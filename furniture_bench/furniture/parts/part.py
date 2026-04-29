@@ -2,6 +2,7 @@ import copy
 import math
 import pdb
 from abc import ABC, abstractmethod
+from typing import Optional
 
 import numpy as np
 import numpy.typing as npt
@@ -16,16 +17,27 @@ from furniture_bench.utils.pose import get_mat, is_similar_pos, is_similar_pose,
 
 class Part(ABC):
     _NM_LATENT_PLAN: bool = True  # episode-level fixed position offsets per state
-    _NM_STEP_NOISE: bool = True  # per-step persistent target-noise; stds passed per call to _add_noise_to_target()
-    _NM_PAUSES: bool = True  # inject random-length hold at each FSM state transition
+    _NM_STEP_NOISE: bool = False  # per-step persistent target-noise; stds passed per call to _add_noise_to_target()
 
-    _NM_STEP_NOISE_PRE_PAUSE_PROB: float = 0.0025  # probability of pre-step pause
-    _NM_STEP_NOISE_POST_PAUSE_PROB: float = 0.0025  # probability of post-step pause
-
+    _NM_STEP_NOISE_POST_PAUSE_PROB: float = 0.005  # probability of pause after a step-noise switch
     _NM_STEP_NOISE_SWITCH_PROB: float = 0.15  # probability of resampling the step noise each timestep
 
-    _NM_MAX_PAUSE: int = 6  # max pause duration (steps); also added to every satisfy() timeout budget
+    _NM_MIN_PAUSE: int = 6  # min pause duration (steps)
+    _NM_MAX_PAUSE: int = 12  # max pause duration (steps); also added to every satisfy() timeout budget
     _NM_PAUSE_EXCLUDED_STATES: frozenset = frozenset()  # states where no pause is injected
+
+    # Virtual-target walk noise tiers (used by furniture_sim_env).
+    _LOW_RANDOM_WALK_NOISE_STD_STATES: frozenset = frozenset()  # sigma scaled by 0.5
+    _ZERO_RANDOM_WALK_NOISE_STD_STATES: frozenset = frozenset()  # sigma set to 0 (deterministic spring)
+    _ZERO_RANDOM_WALK_NOISE_Z_STD_STATES: frozenset = frozenset()  # z-axis sigma set to 0; xy sigma unchanged
+
+    # Default speed config; copied into _current_speed on each reset_speed() call.
+    _DEFAULT_SPEED_CONFIG: dict = {
+        "delta_pos_gain": 2.5,
+        "delta_quat_gain": 1.0,
+        "max_delta_xy": 0.13,
+        "max_delta_z": 0.07,
+    }
 
     @abstractmethod
     def __init__(self, part_config, part_idx: int):
@@ -265,6 +277,7 @@ class Part(ABC):
         step_noise_pos_std=0.0,
         step_noise_pos_std_z=None,
         step_noise_ori_std_deg=0.0,
+        step_noise_pauses=True,
     ):
         """Add noise to TARGET.
 
@@ -285,25 +298,18 @@ class Part(ABC):
 
         # NM step noise: persistent expert offset applied in-place to `target` (= clean_target in callers).
         # Not scaled by dart_amount — this noise is part of the expert and is recorded in clean actions.
-        # With 50% chance, a pause is inserted before the switch (pre-pause) and/or after (post-pause)
         if self.non_markovian and self._NM_STEP_NOISE and (step_noise_pos_std > 0.0 or step_noise_ori_std_deg > 0.0):
             state = self._last_state
             wants_switch = state not in self._step_noise or np.random.random() < self._NM_STEP_NOISE_SWITCH_PROB
 
-            if wants_switch and not self._nm_sn_switch_pending:
-                if np.random.random() < self._NM_STEP_NOISE_PRE_PAUSE_PROB:
-                    # Pre-pause: defer switch; signal env to hold for a few steps first.
-                    self._nm_sn_switch_pending = True
-                    self._nm_sn_pre_pause_steps = int(np.random.randint(0, self._NM_MAX_PAUSE // 2 + 1))
-                else:
-                    # No pre-pause: switch immediately.
-                    self._perform_step_noise_switch(
-                        state, step_noise_pos_std, step_noise_pos_std_z, step_noise_ori_std_deg
-                    )
-            elif self._nm_sn_switch_pending:
-                # Pre-pause complete (env resumed calling fsm_step): perform the deferred switch.
-                self._nm_sn_switch_pending = False
-                self._perform_step_noise_switch(state, step_noise_pos_std, step_noise_pos_std_z, step_noise_ori_std_deg)
+            if wants_switch:
+                self._perform_step_noise_switch(
+                    state,
+                    step_noise_pos_std,
+                    step_noise_pos_std_z,
+                    step_noise_ori_std_deg,
+                    enable_post_pause=step_noise_pauses,
+                )
 
             if state in self._step_noise:
                 step = self._step_noise[state]
@@ -344,7 +350,7 @@ class Part(ABC):
 
         return noisy
 
-    def _perform_step_noise_switch(self, state, pos_std, pos_std_z, ori_std_deg):
+    def _perform_step_noise_switch(self, state, pos_std, pos_std_z, ori_std_deg, enable_post_pause: bool = True):
         """Sample new step noise for `state` and optionally arm a post-switch pause."""
         sp = pos_std
         sz = pos_std_z if pos_std_z is not None else pos_std
@@ -353,9 +359,69 @@ class Part(ABC):
             "pos": np.random.normal(0, [sp, sp, sz]),
             "ori": np.random.normal(0, so, size=3),
         }
-        if np.random.random() < self._NM_STEP_NOISE_POST_PAUSE_PROB:
+        if enable_post_pause and np.random.random() < self._NM_STEP_NOISE_POST_PAUSE_PROB:
             self._nm_sn_post_pause_pending = True
-            self._nm_sn_post_pause_steps = int(np.random.randint(0, self._NM_MAX_PAUSE // 2 + 1))
+            self._nm_sn_post_pause_steps = int(np.random.randint(self._NM_MIN_PAUSE // 2, self._NM_MAX_PAUSE // 2 + 1))
+
+    def _nm_sticky_delay(self, from_state: str, min_delay: int, max_delay: int) -> bool:
+        """Return True if a sticky transition delay is still active (caller should stay in from_state).
+
+        On the first call for a given from_state, samples a uniform countdown in [0, max_delay].
+        Decrements each call until zero, then clears the entry and returns False so the transition fires.
+        Passing max_delay=0 makes the transition immediate (no stickiness).
+        """
+        if from_state not in self._nm_sticky_countdowns:
+            self._nm_sticky_countdowns[from_state] = int(np.random.randint(min_delay, max_delay + 1))
+        if self._nm_sticky_countdowns[from_state] > 0:
+            self._nm_sticky_countdowns[from_state] -= 1
+            return True
+        del self._nm_sticky_countdowns[from_state]
+        return False
+
+    def _nm_defer_transition_with_pause(self, next_state: str) -> str:
+        """Arm a pre-entry pause and hold in the current state until it completes.
+
+        Sets _nm_pending_next_state and requests a pause from the env, then returns
+        _last_state so the caller's compute method keeps executing the current state.
+        On the next FSM call after the pause, _nm_pop_pending_transition() fires the transition.
+        """
+        if not self._NM_PAUSES:
+            return next_state
+        self._nm_pending_next_state = next_state
+        self._nm_transition_pause_requested = True
+        return self._last_state
+
+    def _nm_pop_pending_transition(self) -> Optional[str]:
+        """Return and clear the deferred next state, or None if no transition is pending."""
+        if self._nm_pending_next_state is not None:
+            result = self._nm_pending_next_state
+            self._nm_pending_next_state = None
+            return result
+        return None
+
+    def reset_speed(self):
+        """Restore _current_speed to defaults; called by the env before each FSM step."""
+        self._current_speed = self._DEFAULT_SPEED_CONFIG.copy()
+
+    def set_speed(self, delta_pos_gain=None, delta_quat_gain=None, max_delta_xy=None, max_delta_z=None):
+        """Override one or more speed parameters for the current step.
+
+        Call this anywhere inside fsm_step / pre_assemble to change EE speed.
+        The env resets _current_speed to defaults before each step, so each state
+        starts fresh and can call set_speed() as many times as needed.
+        """
+        if delta_pos_gain is not None:
+            self._current_speed["delta_pos_gain"] = delta_pos_gain
+        if delta_quat_gain is not None:
+            self._current_speed["delta_quat_gain"] = delta_quat_gain
+        if max_delta_xy is not None:
+            self._current_speed["max_delta_xy"] = max_delta_xy
+        if max_delta_z is not None:
+            self._current_speed["max_delta_z"] = max_delta_z
+
+    def get_speed_config(self) -> dict:
+        """Return the speed config set for this step (may have been modified by set_speed())."""
+        return self._current_speed
 
     def reset(self):
         self.pre_assemble_done = False
@@ -364,13 +430,19 @@ class Part(ABC):
         self.prev_cnt = 0
         self.curr_cnt = 0
         self.max_len_offset = 0  # extra steps added to every satisfy() budget; set to _NM_MAX_PAUSE for non-Markovian
+        self._current_speed = self._DEFAULT_SPEED_CONFIG.copy()
         # Non-Markovian latent offset (populated by apply_non_markovian_config)
         self.latent_offsets = {}
         self._step_noise = {}
-        self._nm_sn_switch_pending = False  # pre-pause fired; switch deferred until env resumes
-        self._nm_sn_pre_pause_steps = 0  # read by env to arm a pre-switch pause
-        self._nm_sn_post_pause_pending = False  # read by env to arm a post-switch pause
+        self._nm_sn_post_pause_pending = False  # set by _perform_step_noise_switch; read by env to arm a pause
         self._nm_sn_post_pause_steps = 0
+        # Sticky-transition countdowns: key = from_state, value = steps remaining before transition fires.
+        self._nm_sticky_countdowns: dict[str, int] = {}
+        # Set True in compute_state/compute_pre_assemble_state before returning a state that should trigger a pause.
+        # Consumed (reset to False) by the env after arming the pause.
+        self._nm_transition_pause_requested: bool = False
+        # Deferred transition: next state to enter once the pause completes (None = no pending transition).
+        self._nm_pending_next_state: Optional[str] = None
         # Backward-compat reset for non-Markovian parts
         self.first_setting_target = True
         self.target = None

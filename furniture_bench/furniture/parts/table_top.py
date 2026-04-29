@@ -24,6 +24,27 @@ class TableTop(Part):
     )
     _ZERO_LATENT_TARGET_STD_STATES: frozenset = frozenset({"push"})
 
+    # Virtual-target walk noise tiers (used by furniture_sim_env).
+    _LOW_RANDOM_WALK_NOISE_STD_STATES: frozenset = frozenset({"reach_body_grasp_z", "pick_body", "push", "release"})
+    _ZERO_RANDOM_WALK_NOISE_STD_STATES: frozenset = frozenset()
+
+    # ── Sticky transition delays ───────────────────────────────────────────
+    # Min/Max extra steps the robot lingers in "push" after at_push_xy is first satisfied,
+    # before transitioning to "release".
+    _NM_STICKY_PUSH_RELEASE_MAX_DELAY: int = 15
+    _NM_STICKY_PUSH_RELEASE_MIN_DELAY: int = 9
+
+    # Min/Max extra steps the robot lingers in "reach_body_grasp_z" after at_body_z is first satisfied,
+    # before transitioning to "pick_body".
+    _NM_STICKY_REACH_BODY_GRASP_Z_PICK_BODY_MAX_DELAY: int = 15
+    _NM_STICKY_REACH_BODY_GRASP_Z_PICK_BODY_MIN_DELAY: int = 7
+
+    # ── Desired table-top body XY position ────────────────────────────────────
+    # Desired table-top body XY position when correctly seated against the obstacles.
+    # Used by the NM at_push_xy condition.  Calibrate empirically.
+    _NM_PUSH_BODY_TARGET_X: float = 0.5902
+    _NM_PUSH_BODY_TARGET_Y: float = 0.0838
+
     def __init__(self, part_config: dict, part_idx: int):
         super().__init__(part_config, part_idx)
 
@@ -49,9 +70,9 @@ class TableTop(Part):
         if not self._NM_LATENT_PLAN:
             return
 
-        HIGH_STD = 0.020
+        HIGH_STD = 0.007
         LOW_STD = 0.003
-        HIGH_ORI_STD = np.radians(5.0)
+        HIGH_ORI_STD = np.radians(3.0)
         LOW_ORI_STD = np.radians(2.0)
 
         all_states = [
@@ -123,7 +144,10 @@ class TableTop(Part):
         pos = torch.concat([pos, torch.tensor([1.0], device=device)])
         target_pos = (april_to_robot @ pos)[:3]
         target_ori = (april_to_robot @ rot)[:3, :3]
-        target_pos[2] = ee_pos[2]  # keep current Z
+        if self.non_markovian:
+            target_pos[2] = body_pose_april[2, 3] + 0.025  # Slightly above the table top to avoid collision
+        else:
+            target_pos[2] = ee_pos[2]  # keep current Z
         # Shift grasp from the center of the side to 3/4 along it.
         # body_pose local x-axis runs along the face; half_width/2 = 1/4 of the full
         # side length, moving the grasp point from 1/2 to 3/4 from one end.
@@ -135,7 +159,14 @@ class TableTop(Part):
         return C.to_homogeneous(target_pos, target_ori)
 
     def _get_push_target(
-        self, rb_states, part_idxs, sim_to_april_mat, april_to_robot, ee_pose, device, body_pose_robot
+        self,
+        rb_states,
+        part_idxs,
+        sim_to_april_mat,
+        april_to_robot,
+        ee_pose,
+        device,
+        body_pose_robot,
     ):
         """Compute the push target position from obstacle poses."""
         target_pos = torch.zeros((4,), device=device)
@@ -151,7 +182,7 @@ class TableTop(Part):
             target_pos[1] = max(obstacle_pos[1], target_pos[1])
         target_pos = april_to_robot @ sim_to_april_mat @ target_pos
         target_pos[0] -= self.half_width * 2
-        target_pos[0] -= 0.005  # Empirical offset to avoid early collision with the obstacle
+        target_pos[0] -= 0.005  # Empirical offset to avoid early collision with the long edge of theobstacle
         target_pos[1] -= self.half_width
         target_pos[2] = body_pose_robot[2, 3]
         target_pos = target_pos[:3]
@@ -190,7 +221,13 @@ class TableTop(Part):
         ################################################################################################################
         grasp_target = self._get_grasp_target(body_pose_april, april_to_robot, ee_pos, device)
         push_target = self._get_push_target(
-            rb_states, part_idxs, sim_to_april_mat, april_to_robot, ee_pose, device, body_pose_robot
+            rb_states,
+            part_idxs,
+            sim_to_april_mat,
+            april_to_robot,
+            ee_pose,
+            device,
+            body_pose_robot,
         )
 
         # Latent offsets for the current state used by Non-Markovian policy
@@ -204,7 +241,17 @@ class TableTop(Part):
         gripper_closed = gripper_width <= gripper_closed_thr
         at_grasp_xy = (ee_pos[:2] - (grasp_target[:2, 3] + lo_xy)).abs().sum() < self.pos_error_threshold * 4
         at_body_z = abs(ee_pos[2] - (body_pose_robot[2, 3] + lo_z)) < self.pos_error_threshold * 2
-        at_push_xy = (ee_pos[:2] - (push_target[:2, 3] + lo_xy)).abs().sum() < self.pos_error_threshold * 3
+        if self.non_markovian:
+            body_target_xy = torch.tensor(
+                [self._NM_PUSH_BODY_TARGET_X, self._NM_PUSH_BODY_TARGET_Y],
+                dtype=ee_pos.dtype,
+                device=device,
+            )
+            at_push_xy = (
+                body_pose_robot[:2, 3] - body_target_xy
+            ).abs().sum() < self.pos_error_threshold  # Smaller threshold for NM
+        else:
+            at_push_xy = (ee_pos[:2] - (push_target[:2, 3] + lo_xy)).abs().sum() < self.pos_error_threshold * 3
         z_high = ee_pos[2] >= 0.09 + lo_z
         # Whether the table body has been physically pushed near the push target.
         # This prevents "done"/"go_up" from firing at episode start when the EE happens
@@ -227,17 +274,38 @@ class TableTop(Part):
             current = self._last_state
             nxt = state_sequence[state_sequence.index(current) + 1] if current != "done" else "done"
 
+            # Deferred transition: the pause just completed — fire the pending state change now.
+            pending = self._nm_pop_pending_transition()
+            if pending is not None:
+                return pending
+
             if current == "reach_body_grasp_xy" and at_grasp_xy:
+                # return self.c(nxt)
                 return nxt
             elif current == "reach_body_grasp_z" and at_body_z:
+                if self._nm_sticky_delay(
+                    "reach_body_grasp_z",
+                    self._NM_STICKY_REACH_BODY_GRASP_Z_PICK_BODY_MIN_DELAY,
+                    self._NM_STICKY_REACH_BODY_GRASP_Z_PICK_BODY_MAX_DELAY,
+                ):
+                    return current  # linger in "reach_body_grasp_z" before transitioning to "pick_body"
+                # return self._nm_defer_transition_with_pause(nxt)
                 return nxt
             elif current == "pick_body" and gripper_closed:
+                # return self._nm_defer_transition_with_pause(nxt)
                 return nxt
             elif current == "push" and at_push_xy:
+                if self._nm_sticky_delay(
+                    "push", self._NM_STICKY_PUSH_RELEASE_MIN_DELAY, self._NM_STICKY_PUSH_RELEASE_MAX_DELAY
+                ):
+                    return current  # linger in "push" before releasing
+                # return self._nm_defer_transition_with_pause(nxt)
                 return nxt
             elif current == "release" and gripper_open:
+                # return self._nm_defer_transition_with_pause(nxt)
                 return nxt
             elif current == "go_up" and z_high:
+                # return self._nm_defer_transition_with_pause(nxt)
                 return nxt
             return current
 
@@ -317,7 +385,7 @@ class TableTop(Part):
         elif state == "reach_body_grasp_z":
             grasp_target = self._get_grasp_target(body_pose_april, april_to_robot, ee_pos, device)
             target_pos = grasp_target[:3, 3].clone()
-            target_pos[2] = body_pose_robot[2, 3]
+            target_pos[2] = body_pose_robot[2, 3] + 0.01 if self.non_markovian else body_pose_robot[2, 3]
             target_ori = grasp_target[:3, :3]
 
             clean_target = C.to_homogeneous(target_pos, target_ori)
@@ -378,7 +446,13 @@ class TableTop(Part):
 
         elif state == "release":
             clean_target = self._get_push_target(
-                rb_states, part_idxs, sim_to_april_mat, april_to_robot, ee_pose, device, body_pose_robot
+                rb_states,
+                part_idxs,
+                sim_to_april_mat,
+                april_to_robot,
+                ee_pose,
+                device,
+                body_pose_robot,
             )
             clean_target = self._apply_latent_offset(state, clean_target)
             if self.non_markovian:
@@ -397,7 +471,13 @@ class TableTop(Part):
 
         elif state == "go_up":
             push_target = self._get_push_target(
-                rb_states, part_idxs, sim_to_april_mat, april_to_robot, ee_pose, device, body_pose_robot
+                rb_states,
+                part_idxs,
+                sim_to_april_mat,
+                april_to_robot,
+                ee_pose,
+                device,
+                body_pose_robot,
             )
             target_pos = push_target[:3, 3].clone()
             target_pos[2] = 0.1
@@ -415,7 +495,13 @@ class TableTop(Part):
         elif state == "done":
             self.pre_assemble_done = True
             push_target = self._get_push_target(
-                rb_states, part_idxs, sim_to_april_mat, april_to_robot, ee_pose, device, body_pose_robot
+                rb_states,
+                part_idxs,
+                sim_to_april_mat,
+                april_to_robot,
+                ee_pose,
+                device,
+                body_pose_robot,
             )
             target_pos = push_target[:3, 3].clone()
             target_pos[2] = 0.1
