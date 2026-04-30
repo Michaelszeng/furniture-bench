@@ -36,7 +36,7 @@ class TableTop(Part):
 
     # Min/Max extra steps the robot lingers in "reach_body_grasp_z" after at_body_z is first satisfied,
     # before transitioning to "pick_body".
-    _NM_STICKY_REACH_BODY_GRASP_Z_PICK_BODY_MAX_DELAY: int = 15
+    _NM_STICKY_REACH_BODY_GRASP_Z_PICK_BODY_MAX_DELAY: int = 12
     _NM_STICKY_REACH_BODY_GRASP_Z_PICK_BODY_MIN_DELAY: int = 7
 
     # ── Desired table-top body XY position ────────────────────────────────────
@@ -44,6 +44,14 @@ class TableTop(Part):
     # Used by the NM at_push_xy condition.  Calibrate empirically.
     _NM_PUSH_BODY_TARGET_X: float = 0.5902
     _NM_PUSH_BODY_TARGET_Y: float = 0.0838
+
+    # ── NM push overshoot: shift push target in +x/+y as body nears goal ──────
+    # Once the body is within THRESHOLD of its target XY, the push target gains an
+    # extra offset in +x and +y equal to SCALE / (remaining_dist + C).  This makes
+    # the EE push further as the body converges, preventing it from stalling short.
+    _NM_PUSH_OVERSHOOT_THRESHOLD: float = 0.01  # activation distance (m)
+    _NM_PUSH_OVERSHOOT_SCALE: float = 0.001  # numerator of 1/d term (m²)
+    _NM_PUSH_OVERSHOOT_C: float = 0.002  # denominator constant to prevent divergence (m)
 
     def __init__(self, part_config: dict, part_idx: int):
         super().__init__(part_config, part_idx)
@@ -145,7 +153,7 @@ class TableTop(Part):
         target_pos = (april_to_robot @ pos)[:3]
         target_ori = (april_to_robot @ rot)[:3, :3]
         if self.non_markovian:
-            target_pos[2] = body_pose_april[2, 3] + 0.025  # Slightly above the table top to avoid collision
+            target_pos[2] = body_pose_april[2, 3] + 0.035  # Slightly above the table top to avoid collision
         else:
             target_pos[2] = ee_pos[2]  # keep current Z
         # Shift grasp from the center of the side to 3/4 along it.
@@ -167,6 +175,7 @@ class TableTop(Part):
         ee_pose,
         device,
         body_pose_robot,
+        overshoot: bool = False,
     ):
         """Compute the push target position from obstacle poses."""
         target_pos = torch.zeros((4,), device=device)
@@ -188,6 +197,19 @@ class TableTop(Part):
         target_pos = target_pos[:3]
         if self._grasp_side_offset_robot is not None:
             target_pos = target_pos + self._grasp_side_offset_robot
+        if self.non_markovian and overshoot:
+            # NM push overshoot: shift push target in +x/+y as body nears goal
+            body_xy = body_pose_robot[:2, 3]
+            goal_xy = torch.tensor(
+                [self._NM_PUSH_BODY_TARGET_X, self._NM_PUSH_BODY_TARGET_Y],
+                dtype=body_xy.dtype,
+                device=device,
+            )
+            remaining_dist = float((body_xy - goal_xy).norm())
+            if remaining_dist < self._NM_PUSH_OVERSHOOT_THRESHOLD:
+                shift = self._NM_PUSH_OVERSHOOT_SCALE / (remaining_dist + self._NM_PUSH_OVERSHOOT_C)
+                target_pos[0] = target_pos[0] + shift
+                # target_pos[1] = target_pos[1] + shift
         target_ori = torch.zeros((3, 3), device=device)
         target_ori[0][1] = 1
         target_ori[1][0] = 1
@@ -239,7 +261,10 @@ class TableTop(Part):
 
         gripper_open = gripper_width >= gripper_open_thr
         gripper_closed = gripper_width <= gripper_closed_thr
-        at_grasp_xy = (ee_pos[:2] - (grasp_target[:2, 3] + lo_xy)).abs().sum() < self.pos_error_threshold * 4
+        if self.non_markovian:
+            at_grasp_xy = (ee_pos[:2] - (grasp_target[:2, 3] + lo_xy)).abs().sum() < self.pos_error_threshold * 5
+        else:
+            at_grasp_xy = (ee_pos[:2] - (grasp_target[:2, 3] + lo_xy)).abs().sum() < self.pos_error_threshold * 4
         at_body_z = abs(ee_pos[2] - (body_pose_robot[2, 3] + lo_z)) < self.pos_error_threshold * 2
         if self.non_markovian:
             body_target_xy = torch.tensor(
@@ -426,7 +451,14 @@ class TableTop(Part):
 
         elif state == "push":
             clean_target = self._get_push_target(
-                rb_states, part_idxs, sim_to_april_mat, april_to_robot, ee_pose, device, body_pose_robot
+                rb_states,
+                part_idxs,
+                sim_to_april_mat,
+                april_to_robot,
+                ee_pose,
+                device,
+                body_pose_robot,
+                overshoot=True if self.non_markovian else False,
             )
             clean_target = self._apply_latent_offset(state, clean_target)
             if self.non_markovian:

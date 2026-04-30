@@ -21,7 +21,7 @@ class Leg(Part):
     # ── Per-state noise tiers ──────────────────────────────────────────────────
     # Target-noise tiers (used by apply_non_markovian_config for latent offsets)
     _LOW_LATENT_TARGET_STD_STATES: frozenset = frozenset(
-        {"reach_leg_floor_z", "pick_leg", "reach_table_top_z", "pre_screw", "release"}
+        {"reach_leg_floor_z", "pick_leg", "reach_table_top_z", "release"}
     )
     _LOW_LATENT_TARGET_Z_STD_STATES: frozenset = frozenset(
         {
@@ -34,7 +34,7 @@ class Leg(Part):
         }
     )
     _ZERO_LATENT_TARGET_POS_STD_STATES: frozenset = frozenset(
-        {"reach_leg_ori", "reach_leg_floor_z", "screw_grasp", "screw", "insert_release", "insert"}
+        {"reach_leg_ori", "reach_leg_floor_z", "pre_screw", "screw_grasp", "screw", "insert_release", "insert"}
     )
     _ZERO_LATENT_TARGET_ORI_STD_STATES: frozenset = frozenset(
         {"reach_leg_ori", "pre_screw", "screw_grasp", "screw", "insert_release", "insert"}
@@ -424,7 +424,9 @@ class Leg(Part):
         # EE orientation checks (used across multiple GRASPED sub-phases)
         ee_at_insert_ori = (ee_pose[:3, :3] - insert_target_ori).abs().sum() < self.ori_error_threshold * 3
         # Loose bound: used to decide when the EE has sufficiently rotated to proceed toward the hole.
-        ee_at_insert_ori_loose = (ee_pose[:3, :3] - insert_target_ori).abs().sum() <= self.ori_error_threshold * (5 if self.non_markovian else 4)
+        ee_at_insert_ori_loose = (ee_pose[:3, :3] - insert_target_ori).abs().sum() <= self.ori_error_threshold * (
+            5 if self.non_markovian else 4
+        )
 
         # Sometimes, due to action noise, leg_xy_near_hole may become untrue momentarily.
         # If the leg is still close to the hole and the robot is moving downward, we know we're probably still in
@@ -827,7 +829,11 @@ class Leg(Part):
             target_ori = floor_grasp_ori(leg_pose_down)
             leg_pos_robot = (april_to_robot @ leg_pose_down[:4, 3])[:3]
             target_pos = leg_pos_robot.clone()
-            target_pos[0] = leg_pos_robot[0] + self._PICK_X_OFFSET + (self._NM_REACH_LEG_FLOOR_Z_ALIGN_X_OFFSET_MAX if self.non_markovian else 0.0)
+            target_pos[0] = (
+                leg_pos_robot[0]
+                + self._PICK_X_OFFSET
+                + (self._NM_REACH_LEG_FLOOR_Z_ALIGN_X_OFFSET_MAX if self.non_markovian else 0.0)
+            )
             target_pos[2] = leg_pos_robot[2] + self._ORI_Z_CLEARANCE  # keep clearance above leg during EE rotation
             clean_target = C.to_homogeneous(target_pos, target_ori)
             clean_target = self._apply_latent_offset(state, clean_target)
