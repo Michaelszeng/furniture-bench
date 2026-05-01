@@ -49,9 +49,9 @@ class TableTop(Part):
     # Once the body is within THRESHOLD of its target XY, the push target gains an
     # extra offset in +x and +y equal to SCALE / (remaining_dist + C).  This makes
     # the EE push further as the body converges, preventing it from stalling short.
-    _NM_PUSH_OVERSHOOT_THRESHOLD: float = 0.01  # activation distance (m)
-    _NM_PUSH_OVERSHOOT_SCALE: float = 0.001  # numerator of 1/d term (m²)
-    _NM_PUSH_OVERSHOOT_C: float = 0.002  # denominator constant to prevent divergence (m)
+    _NM_PUSH_OVERSHOOT_THRESHOLD: float = 0.011  # activation distance (m)
+    _NM_PUSH_OVERSHOOT_SCALE: float = 0.01  # numerator of 1/d term (m²)
+    _NM_PUSH_OVERSHOOT_C: float = 0.001  # denominator constant to prevent divergence (m)
 
     def __init__(self, part_config: dict, part_idx: int):
         super().__init__(part_config, part_idx)
@@ -207,7 +207,10 @@ class TableTop(Part):
             )
             remaining_dist = float((body_xy - goal_xy).norm())
             if remaining_dist < self._NM_PUSH_OVERSHOOT_THRESHOLD:
-                shift = self._NM_PUSH_OVERSHOOT_SCALE / (remaining_dist + self._NM_PUSH_OVERSHOOT_C)
+                # https://www.desmos.com/calculator/kglflxsmhg
+                shift = self._NM_PUSH_OVERSHOOT_SCALE / (remaining_dist + self._NM_PUSH_OVERSHOOT_C) - (
+                    self._NM_PUSH_OVERSHOOT_SCALE / (self._NM_PUSH_OVERSHOOT_THRESHOLD + self._NM_PUSH_OVERSHOOT_C)
+                )
                 target_pos[0] = target_pos[0] + shift
                 # target_pos[1] = target_pos[1] + shift
         target_ori = torch.zeros((3, 3), device=device)
@@ -265,7 +268,8 @@ class TableTop(Part):
             at_grasp_xy = (ee_pos[:2] - (grasp_target[:2, 3] + lo_xy)).abs().sum() < self.pos_error_threshold * 5
         else:
             at_grasp_xy = (ee_pos[:2] - (grasp_target[:2, 3] + lo_xy)).abs().sum() < self.pos_error_threshold * 4
-        at_body_z = abs(ee_pos[2] - (body_pose_robot[2, 3] + lo_z)) < self.pos_error_threshold * 2
+        self.grasp_z_offset = 0.009 if self.non_markovian else 0.0
+        at_body_z = abs(ee_pos[2] - (body_pose_robot[2, 3] + self.grasp_z_offset + lo_z)) < self.pos_error_threshold * 2
         if self.non_markovian:
             body_target_xy = torch.tensor(
                 [self._NM_PUSH_BODY_TARGET_X, self._NM_PUSH_BODY_TARGET_Y],
@@ -410,7 +414,7 @@ class TableTop(Part):
         elif state == "reach_body_grasp_z":
             grasp_target = self._get_grasp_target(body_pose_april, april_to_robot, ee_pos, device)
             target_pos = grasp_target[:3, 3].clone()
-            target_pos[2] = body_pose_robot[2, 3] + 0.01 if self.non_markovian else body_pose_robot[2, 3]
+            target_pos[2] = body_pose_robot[2, 3] + self.grasp_z_offset
             target_ori = grasp_target[:3, :3]
 
             clean_target = C.to_homogeneous(target_pos, target_ori)
@@ -450,6 +454,8 @@ class TableTop(Part):
                 timeout_failure = True
 
         elif state == "push":
+            if self.non_markovian:
+                self.set_speed(delta_pos_gain=5.0, max_delta_xy=0.5)
             clean_target = self._get_push_target(
                 rb_states,
                 part_idxs,

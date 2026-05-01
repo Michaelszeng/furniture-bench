@@ -78,15 +78,26 @@ class Leg(Part):
     # Before reaching the final pick pose, the EE makes 1..MAX_CYCLES approaches
     # from progressively smaller positive-x / positive-z offsets, with a random y
     # jitter each cycle.  The final cycle uses the clean target with no offset.
-    _NM_REACH_LEG_FLOOR_Z_MIN_ALIGN_CYCLES: int = 2
+    _NM_REACH_LEG_FLOOR_Z_MIN_ALIGN_CYCLES: int = 3  # must be >=2 or will cause divide by zero error
     _NM_REACH_LEG_FLOOR_Z_MAX_ALIGN_CYCLES: int = 4  # max staged cycles (final clean cycle always added)
     _NM_REACH_LEG_FLOOR_Z_ALIGN_STEPS_MIN: int = 8  # min steps per cycle
-    _NM_REACH_LEG_FLOOR_Z_ALIGN_STEPS_MAX: int = 12  # max steps per cycle
-    _NM_REACH_LEG_FLOOR_Z_ALIGN_X_OFFSET_MAX: float = 0.03  # x offset (m) at cycle 0, ramps to 0
-    _NM_REACH_LEG_FLOOR_Z_ALIGN_Z_OFFSET_MAX: float = 0.03  # z offset (m) at cycle 0, ramps to 0
-    _NM_REACH_LEG_FLOOR_Z_ALIGN_X_STD: float = 0.02  # std of random x jitter per cycle (m)
-    _NM_REACH_LEG_FLOOR_Z_ALIGN_Y_STD: float = 0.014  # std of random y jitter per cycle (m)
+    _NM_REACH_LEG_FLOOR_Z_ALIGN_STEPS_MAX: int = 11  # max steps per cycle
+    _NM_REACH_LEG_FLOOR_Z_ALIGN_X_OFFSET_MAX: float = 0.02  # x offset (m) at cycle 0, ramps to 0
+    _NM_REACH_LEG_FLOOR_Z_ALIGN_Z_OFFSET_MAX: float = 0.02  # z offset (m) at cycle 0, ramps to 0
+    _NM_REACH_LEG_FLOOR_Z_ALIGN_X_STD: float = 0.015  # std of random x jitter per cycle (m)
+    _NM_REACH_LEG_FLOOR_Z_ALIGN_Y_STD: float = 0.01  # std of random y jitter per cycle (m)
     _NM_REACH_LEG_FLOOR_Z_ALIGN_Z_STD: float = 0.01  # std of random z jitter per cycle (m)
+
+    # ── NM reach_table_top_z random alignment cycles ─────────────────────────
+    # Before descending to insert, the EE makes 1..MAX_CYCLES passes with random XY
+    # offsets from the hole centre, mimicking a human hovering/jittering to check
+    # alignment.  After all cycles, the EE targets the clean hole position.
+    _NM_REACH_TABLE_TOP_Z_MIN_ALIGN_CYCLES: int = 2
+    _NM_REACH_TABLE_TOP_Z_MAX_ALIGN_CYCLES: int = 2
+    _NM_REACH_TABLE_TOP_Z_ALIGN_STEPS_MIN: int = 9  # min steps per cycle
+    _NM_REACH_TABLE_TOP_Z_ALIGN_STEPS_MAX: int = 10  # max steps per cycle
+    _NM_REACH_TABLE_TOP_Z_ALIGN_XY_STD: float = 0.006  # std of random XY offset per cycle (m)
+    _NM_REACH_TABLE_TOP_Z_ALIGN_XY_MAX: float = 0.009  # max absolute XY offset per cycle (m)
 
     # ── NM insertion descent pauses ───────────────────────────────────────────
     # During reach_table_top_z, the robot may randomly pause its descent to mimic
@@ -171,6 +182,11 @@ class Leg(Part):
         self.nm_reach_leg_floor_z_align_done = False
         self.nm_reach_leg_floor_z_align_step_end = 0
         self.nm_reach_leg_floor_z_align_offset = None
+        # reach_table_top_z random alignment cycles state (NM only).
+        self.nm_reach_table_top_z_align_cycles_remaining = None
+        self.nm_reach_table_top_z_align_done = False
+        self.nm_reach_table_top_z_align_step_end = 0
+        self.nm_reach_table_top_z_align_offset = None
         # Insertion descent pause state (NM only).
         self.nm_insertion_pause_step_end: int = 0
         self.nm_insertion_pause_cached_z: float = 0.0
@@ -386,7 +402,7 @@ class Leg(Part):
         # Gate on orientation alignment between EE and leg.
         # Randomized gate to get some grasp angle variation.
         at_grasp_ori_floor = (ee_pose[:3, :3] - grasp_target_ori).abs().sum() < self.ori_error_threshold * 3
-        at_pick_z = abs(ee_pos[2] - (pick_target_z + lo_t[2])) < self.pos_error_threshold
+        at_pick_z = abs(ee_pos[2] - (pick_target_z + lo_t[2])) < self.pos_error_threshold * 0.75
 
         # gripper_grasped: leg is physically between the fingers.
         # When the leg (diameter = 2*half_width) is held, physics prevents the gripper
@@ -497,7 +513,7 @@ class Leg(Part):
             elif current == "reach_leg_ori" and at_grasp_ori_floor:
                 # return self._nm_defer_transition_with_pause("reach_leg_floor_z")
                 return "reach_leg_floor_z"  # no pause on entry to reach_leg_floor_z
-            elif current == "reach_leg_floor_z" and at_pick_z:
+            elif current == "reach_leg_floor_z" and at_pick_z and at_pick_xy:
                 if self._nm_sticky_delay(
                     "reach_leg_floor_z",
                     self._NM_STICKY_REACH_LEG_FLOOR_Z_PICK_LEG_MIN_DELAY,
@@ -726,6 +742,9 @@ class Leg(Part):
                 self.nm_reach_leg_floor_z_align_done = False
             if state in ("reach_table_top_z", "insert"):
                 self.nm_insertion_pause_step_end = 0
+            if state == "reach_table_top_z":
+                self.nm_reach_table_top_z_align_cycles_remaining = None
+                self.nm_reach_table_top_z_align_done = False
 
         # Throttled state print (every 10 steps)
         if self.curr_cnt % 10 == 0:
@@ -871,7 +890,8 @@ class Leg(Part):
                 # decreases linearly each cycle.  A random y jitter is added per cycle.
                 # The final clean cycle has no offset.  Mimics a human aiming in stages.
                 def new_floor_z_cycle(cycle_idx, total):
-                    frac = cycle_idx / total if total > 0 else 0.0
+                    # Subtract 1 from numerator and denominator so the last 2 cycles both have frac=0.0.
+                    frac = max(cycle_idx - 1, 0) / (total - 1) if total > 0 else 0.0  # fraction of X/Z offset to apply
                     x_off = self._NM_REACH_LEG_FLOOR_Z_ALIGN_X_OFFSET_MAX * frac + float(
                         np.clip(
                             np.random.normal(0, self._NM_REACH_LEG_FLOOR_Z_ALIGN_X_STD),
@@ -1076,34 +1096,57 @@ class Leg(Part):
                 device=device,
             )
             target_leg_tip_pose_robot[:3, :3] = ry3 @ target_leg_tip_pose_robot[:3, :3]  # Apply y-axis rotation
+
+            # NM: reach_table_top_z only descends to the handoff depth; the "insert" state finishes insertion.
             if self.non_markovian:
-                # NM: reach_table_top_z only descends to the handoff depth; the "insert" state finishes insertion.
                 target_leg_tip_pose_robot[2, 3] = self._INSERT_HANDOFF_Z - 0.002
+
+                # Random alignment cycles: jitter XY target before committing to insertion.
+                def new_table_top_z_cycle():
+                    xy_std = self._NM_REACH_TABLE_TOP_Z_ALIGN_XY_STD
+                    xy_max = self._NM_REACH_TABLE_TOP_Z_ALIGN_XY_MAX
+                    x_off = float(np.clip(np.random.normal(0, xy_std), -xy_max, xy_max))
+                    y_off = float(np.clip(np.random.normal(0, xy_std), -xy_max, xy_max))
+                    self.nm_reach_table_top_z_align_offset = torch.tensor(
+                        [x_off, y_off], dtype=target_leg_tip_pose_robot.dtype, device=device
+                    )
+                    self.nm_reach_table_top_z_align_step_end = self.curr_cnt + np.random.randint(
+                        self._NM_REACH_TABLE_TOP_Z_ALIGN_STEPS_MIN, self._NM_REACH_TABLE_TOP_Z_ALIGN_STEPS_MAX + 1
+                    )
+
+                if self.nm_reach_table_top_z_align_cycles_remaining is None:
+                    self.nm_reach_table_top_z_align_cycles_remaining = np.random.randint(
+                        self._NM_REACH_TABLE_TOP_Z_MIN_ALIGN_CYCLES, self._NM_REACH_TABLE_TOP_Z_MAX_ALIGN_CYCLES + 1
+                    )
+                    new_table_top_z_cycle()
+                    self.nm_reach_table_top_z_align_step_end += 1  # +1 so first cycle lasts full randint steps
+
+                if (
+                    not self.nm_reach_table_top_z_align_done
+                    and self.curr_cnt >= self.nm_reach_table_top_z_align_step_end
+                ):
+                    self.nm_reach_table_top_z_align_cycles_remaining -= 1
+                    if self.nm_reach_table_top_z_align_cycles_remaining > 0:
+                        new_table_top_z_cycle()
+                    else:
+                        self.nm_reach_table_top_z_align_done = True
+
+                if not self.nm_reach_table_top_z_align_done:
+                    target_leg_tip_pose_robot[0, 3] = (
+                        target_leg_tip_pose_robot[0, 3] + self.nm_reach_table_top_z_align_offset[0]
+                    )
+                    target_leg_tip_pose_robot[1, 3] = (
+                        target_leg_tip_pose_robot[1, 3] + self.nm_reach_table_top_z_align_offset[1]
+                    )
+                    print(
+                        f"[reach_table_top_z NM align] cycles_left={self.nm_reach_table_top_z_align_cycles_remaining}"
+                        f"  offset=({self.nm_reach_table_top_z_align_offset[0]:.3f},"
+                        f" {self.nm_reach_table_top_z_align_offset[1]:.3f})"
+                    )
+
             rel = rel_rot_mat(leg_tip_pose_robot, target_leg_tip_pose_robot)
             clean_target = rel @ ee_pose
-            # NM descent pause: randomly freeze z-target to mimic human pausing to check alignment.
-            # Only fires when the leg is safely above the hole (leg_tip_z_rel > STUCK_Z_HIGH).
-            if self.non_markovian:
-                STUCK_Z_HIGH = 0.01675
-                if self.nm_insertion_pause_step_end > 0 and self.curr_cnt < self.nm_insertion_pause_step_end:
-                    # Active pause: hold EE at the frozen z so the robot stops descending.
-                    clean_target[2, 3] = self.nm_insertion_pause_cached_z
-                else:
-                    self.nm_insertion_pause_step_end = 0
-                    if (
-                        self.leg_tip_z_rel > STUCK_Z_HIGH
-                        and self.leg_tip_z_rel < STUCK_Z_HIGH + 0.007
-                        and np.random.random() < self._NM_INSERTION_PAUSE_PROB
-                    ):
-                        # Cache the CURRENT EE z (not the fixed destination z) so the robot holds in place.
-                        self.nm_insertion_pause_cached_z = ee_pose[2, 3].item()
-                        self.nm_insertion_pause_step_end = self.curr_cnt + np.random.randint(
-                            self._NM_INSERTION_PAUSE_STEPS_MIN, self._NM_INSERTION_PAUSE_STEPS_MAX + 1
-                        )
-                        clean_target[2, 3] = self.nm_insertion_pause_cached_z
-                        print(
-                            f"[reach_table_top_z NM] pause started for {self.nm_insertion_pause_step_end - self.curr_cnt} steps at z={self.nm_insertion_pause_cached_z:.4f}"
-                        )
+
             # Don't add as much noise if the leg got stuck
             # Note that this is non-markovian but doesn't make the policy non-markovian,
             # since this only affects the noise added during simulation, doesn't affect the actual recorded actions.

@@ -162,6 +162,7 @@ class FurnitureSimEnv(gym.Env):
         self.manual_done = manual_done
         self.headless = headless
         self.ctrl_started = False
+        self.last_torque_action = None  # saved by env.step() for state snapshot/restore
         self._image_access_started = False
         self.init_assembled = init_assembled
         self.np_step_out = np_step_out
@@ -884,8 +885,10 @@ class FurnitureSimEnv(gym.Env):
                     pos_action[env_idx, 7:9] = 0.0
 
             if self.ctrl_mode == "osc":
+                self.last_torque_action = torque_action.clone()
                 self.isaac_gym.set_dof_actuation_force_tensor(self.sim, gymtorch.unwrap_tensor(torque_action))
             else:
+                self.last_torque_action = torque_action.clone()
                 self.isaac_gym.set_dof_position_target_tensor(self.sim, gymtorch.unwrap_tensor(pos_action))
                 self.isaac_gym.set_dof_actuation_force_tensor(self.sim, gymtorch.unwrap_tensor(torque_action))
 
