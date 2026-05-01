@@ -21,7 +21,7 @@ class Leg(Part):
     # ── Per-state noise tiers ──────────────────────────────────────────────────
     # Target-noise tiers (used by apply_non_markovian_config for latent offsets)
     _LOW_LATENT_TARGET_STD_STATES: frozenset = frozenset(
-        {"reach_leg_floor_z", "pick_leg", "reach_table_top_z", "release"}
+        {"reach_leg_floor_z", "pick_leg", "reach_table_top_z", "release", "pre_screw"}
     )
     _LOW_LATENT_TARGET_Z_STD_STATES: frozenset = frozenset(
         {
@@ -34,10 +34,10 @@ class Leg(Part):
         }
     )
     _ZERO_LATENT_TARGET_POS_STD_STATES: frozenset = frozenset(
-        {"reach_leg_ori", "reach_leg_floor_z", "pre_screw", "screw_grasp", "screw", "insert_release", "insert"}
+        {"reach_leg_ori", "reach_leg_floor_z", "screw_grasp", "screw", "insert_release", "insert"}
     )
     _ZERO_LATENT_TARGET_ORI_STD_STATES: frozenset = frozenset(
-        {"reach_leg_ori", "pre_screw", "screw_grasp", "screw", "insert_release", "insert"}
+        {"reach_leg_ori", "screw_grasp", "screw", "insert_release", "insert"}
     )
 
     # Action-noise tiers (used by furniture_sim_env when computing the executed action).
@@ -66,13 +66,17 @@ class Leg(Part):
     # Before closing the gripper, the EE makes 1..MAX_CYCLES random target shifts
     # (mimicking a human repositioning to align) followed by one final clean cycle.
     _NM_SCREW_GRASP_MIN_ALIGN_CYCLES: int = 1
-    _NM_SCREW_GRASP_MAX_ALIGN_CYCLES: int = 3  # max random cycles (final clean cycle is always added)
+    _NM_SCREW_GRASP_MAX_ALIGN_CYCLES: int = 2  # max random cycles
     _NM_SCREW_GRASP_ALIGN_STEPS_MIN: int = 3  # min steps per cycle
     _NM_SCREW_GRASP_ALIGN_STEPS_MAX: int = 9  # max steps per cycle
     _NM_SCREW_GRASP_ALIGN_CLEAN_CYCLE_EXTRA_STEPS: int = (
         12  # extra steps added to the final clean cycle for VT convergence
     )
-    _NM_SCREW_GRASP_ALIGN_POS_STD: float = 0.008  # std of random XY offset (m)
+    _NM_SCREW_GRASP_ALIGN_POS_STD: float = 0.008  # std of random XY offset for non-final cycles (m)
+    # Per-axis STD for the final cycle (slightly random landing pose before gripper closes).
+    _NM_SCREW_GRASP_ALIGN_FINAL_STD_X: float = 0.004
+    _NM_SCREW_GRASP_ALIGN_FINAL_STD_Y: float = 0.002
+    _NM_SCREW_GRASP_ALIGN_FINAL_STD_Z: float = 0.001
 
     # ── NM reach_leg_floor_z staged alignment ────────────────────────────────
     # Before reaching the final pick pose, the EE makes 1..MAX_CYCLES approaches
@@ -92,7 +96,7 @@ class Leg(Part):
     # Before descending to insert, the EE makes 1..MAX_CYCLES passes with random XY
     # offsets from the hole centre, mimicking a human hovering/jittering to check
     # alignment.  After all cycles, the EE targets the clean hole position.
-    _NM_REACH_TABLE_TOP_Z_MIN_ALIGN_CYCLES: int = 2
+    _NM_REACH_TABLE_TOP_Z_MIN_ALIGN_CYCLES: int = 1
     _NM_REACH_TABLE_TOP_Z_MAX_ALIGN_CYCLES: int = 2
     _NM_REACH_TABLE_TOP_Z_ALIGN_STEPS_MIN: int = 9  # min steps per cycle
     _NM_REACH_TABLE_TOP_Z_ALIGN_STEPS_MAX: int = 10  # max steps per cycle
@@ -872,7 +876,7 @@ class Leg(Part):
                 timeout_failure = True
         elif state == "reach_leg_floor_z":
             if self.non_markovian:
-                self.set_speed(delta_pos_gain=1.2, max_delta_xy=0.01)
+                self.set_speed(delta_pos_gain=1.2, max_delta_xy=0.005)
 
             if self.non_markovian:
                 if self.nm_floor_pick_cached_leg_pose_down is None:
@@ -1078,7 +1082,7 @@ class Leg(Part):
             if result == "TIMEOUT":
                 timeout_failure = True
         elif state == "reach_table_top_z":
-            self.set_speed(max_delta_z=0.015)
+            self.set_speed(max_delta_xy=0.004, max_delta_z=0.015)
             target_leg_tip_pose_robot = torch.tensor(
                 [  # Target for leg TIP: LEG_HOLE_OFFSET_X/Y align tip with table hole
                     [1.0, 0.0, 0.0, table_hole_pose_robot[0, 3] + self._LEG_HOLE_OFFSET_X],
@@ -1298,11 +1302,17 @@ class Leg(Part):
             if self.non_markovian:
                 # Alignment phase: 1..MAX_ALIGN_CYCLES random target shifts followed by one
                 # clean cycle, then close the gripper.  Mimics a human repositioning before grasping.
-                def new_cycle(random_offset):
-                    xy = (
-                        np.random.normal(0, self._NM_SCREW_GRASP_ALIGN_POS_STD, size=2) if random_offset else (0.0, 0.0)
-                    )
-                    self.nm_screw_grasp_align_offset = torch.tensor([*xy, 0.0], dtype=target_pos.dtype, device=device)
+                def new_cycle(final_cycle):
+                    if final_cycle:
+                        xy = np.random.normal(0, self._NM_SCREW_GRASP_ALIGN_POS_STD, size=2)
+                        xyz = [*xy, 0.0]
+                    else:
+                        xyz = [
+                            np.random.normal(0, self._NM_SCREW_GRASP_ALIGN_FINAL_STD_X),
+                            np.random.normal(0, self._NM_SCREW_GRASP_ALIGN_FINAL_STD_Y),
+                            np.random.normal(0, self._NM_SCREW_GRASP_ALIGN_FINAL_STD_Z),
+                        ]
+                    self.nm_screw_grasp_align_offset = torch.tensor(xyz, dtype=target_pos.dtype, device=device)
                     self.nm_screw_grasp_align_step_end = self.curr_cnt + np.random.randint(
                         self._NM_SCREW_GRASP_ALIGN_STEPS_MIN, self._NM_SCREW_GRASP_ALIGN_STEPS_MAX + 1
                     )
@@ -1311,7 +1321,7 @@ class Leg(Part):
                     self.nm_screw_grasp_align_cycles_remaining = np.random.randint(
                         self._NM_SCREW_GRASP_MIN_ALIGN_CYCLES, self._NM_SCREW_GRASP_MAX_ALIGN_CYCLES + 1
                     )
-                    new_cycle(random_offset=True)
+                    new_cycle(final_cycle=True)
                     # Same +1 correction as pick_leg: curr_cnt increments at end of the
                     # transition step, so shift step_end to give the full cycle duration after the pause.
                     self.nm_screw_grasp_align_step_end += 1
@@ -1319,9 +1329,9 @@ class Leg(Part):
                 if not self.nm_screw_grasp_align_done and self.curr_cnt >= self.nm_screw_grasp_align_step_end:
                     self.nm_screw_grasp_align_cycles_remaining -= 1
                     if self.nm_screw_grasp_align_cycles_remaining > 0:
-                        new_cycle(random_offset=True)
+                        new_cycle(final_cycle=True)
                     elif self.nm_screw_grasp_align_cycles_remaining == 0:
-                        new_cycle(random_offset=False)  # final clean cycle
+                        new_cycle(final_cycle=False)  # final clean cycle
                         self.nm_screw_grasp_align_step_end += self._NM_SCREW_GRASP_ALIGN_CLEAN_CYCLE_EXTRA_STEPS
                     else:
                         self.nm_screw_grasp_align_done = True

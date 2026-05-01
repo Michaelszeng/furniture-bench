@@ -35,8 +35,8 @@ class Part(ABC):
     _DEFAULT_SPEED_CONFIG: dict = {
         "delta_pos_gain": 2.5,
         "delta_quat_gain": 1.0,
-        "max_delta_xy": 0.13,
-        "max_delta_z": 0.07,
+        "max_delta_xy": 0.145,
+        "max_delta_z": 0.085,
     }
 
     @abstractmethod
