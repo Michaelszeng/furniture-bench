@@ -54,6 +54,8 @@ ASSET_ROOT = str(Path(__file__).parent.parent.absolute() / "assets")
 # Target noise: (1) FSM per-step goal-pose jitter via _add_noise_to_target() [main jitter source];
 #               (2) randomised kick multiplier and XY speed limit in _compute_delta_pos.
 _ENABLE_TARGET_NOISE: bool = True
+# Lift EE to Z=0.15 (gripper open) after all assembly pairs are complete.
+_ENABLE_POST_ASSEMBLE_LIFT: bool = False
 # Action noise: i.i.d. Gaussian on delta_pos and orientation
 _ENABLE_ACTION_NOISE: bool = True
 # Temporally correlated (OU) action noise (non-Markovian only); independent of i.i.d. noise
@@ -1596,7 +1598,7 @@ class FurnitureSimEnv(gym.Env):
 
             # Move-neutral: after all pairs assembled (or between pairs), lift EE before proceeding to next pair
             if assemble_idx >= n_pairs:
-                if ee_pos[2] < 0.14:
+                if _ENABLE_POST_ASSEMBLE_LIFT and ee_pos[2] < 0.14:
                     gripper = torch.tensor([-1], dtype=torch.float32, device=self.device)
                     goal_pos = torch.tensor([ee_pos[0], ee_pos[1], 0.15], device=self.device)
                     delta_pos = goal_pos - ee_pos
