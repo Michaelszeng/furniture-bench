@@ -10,8 +10,15 @@ import torch
 @torch.jit.script
 def opspace_matrices(mass_matrix, J_full):
     """Compute the lambda and nullspace matrices for the operational space control."""
-    # Optimize code above.
-    lambda_full_inv = torch.matmul(J_full, torch.linalg.solve(mass_matrix, J_full.T))
+    # Tikhonov regularization on the mass matrix so torch.linalg.solve never fails
+    # at kinematic singularities (observed in IsaacGym rollouts). The damping is
+    # small enough that it does not meaningfully alter dynamics.
+    eps = 1e-6
+    mass_matrix_reg = mass_matrix + eps * torch.eye(
+        mass_matrix.shape[-1], device=mass_matrix.device, dtype=mass_matrix.dtype
+    )
+
+    lambda_full_inv = torch.matmul(J_full, torch.linalg.solve(mass_matrix_reg, J_full.T))
 
     # take the inverses, but zero out small singular values for stability
     svd_u, svd_s, svd_v = torch.linalg.svd(lambda_full_inv)
@@ -22,7 +29,7 @@ def opspace_matrices(mass_matrix, J_full):
     lambda_full = svd_v.T.matmul(torch.diag(svd_s_inv)).matmul(svd_u.T)
 
     # nullspace
-    Jbar = torch.linalg.solve(mass_matrix, J_full.t()).matmul(lambda_full)
+    Jbar = torch.linalg.solve(mass_matrix_reg, J_full.t()).matmul(lambda_full)
     nullspace_matrix = torch.eye(J_full.shape[-1], J_full.shape[-1]).to(
         mass_matrix.device
     ) - torch.matmul(Jbar, J_full)
