@@ -111,7 +111,7 @@ class Leg(Part):
     _NM_INSERTION_PAUSE_STEPS_MAX: int = 8
 
     # ── Sticky transition delays ───────────────────────────────────────────
-    _NM_STICKY_REACH_LEG_FLOOR_Z_PICK_LEG_MIN_DELAY: int = 6
+    _NM_STICKY_REACH_LEG_FLOOR_Z_PICK_LEG_MIN_DELAY: int = 8
     _NM_STICKY_REACH_LEG_FLOOR_Z_PICK_LEG_MAX_DELAY: int = 12
 
     _NM_STICKY_PICK_LEG_LIFT_UP_MIN_DELAY: int = 5
@@ -121,10 +121,10 @@ class Leg(Part):
     _NM_STICKY_PRE_SCREW_SCREW_GRASP_MAX_DELAY: int = 8
 
     _NM_STICKY_REACH_TABLE_TOP_Z_INSERT_MIN_DELAY: int = 5  # linger at alignment before committing to insert
-    _NM_STICKY_REACH_TABLE_TOP_Z_INSERT_MAX_DELAY: int = 7
+    _NM_STICKY_REACH_TABLE_TOP_Z_INSERT_MAX_DELAY: int = 9
 
     _NM_STICKY_SCREW_RELEASE_MIN_DELAY: int = 4
-    _NM_STICKY_SCREW_RELEASE_MAX_DELAY: int = 7
+    _NM_STICKY_SCREW_RELEASE_MAX_DELAY: int = 8
 
     # Ry angle (radians) that pitches the EE toward the floor during the floor pick-up.
     # Adjust here to change the grasp tilt; used identically in compute_state and fsm_step.
@@ -434,7 +434,7 @@ class Leg(Part):
             leg_xy_near_hole = torch.norm(_leg_tip_xy - table_hole_pos_robot[:2]) < 0.015  # looser for NM
             leg_xy_near_hole_loose = torch.norm(_leg_tip_xy - table_hole_pos_robot[:2]) < 0.020
         else:
-            leg_xy_near_hole = torch.norm(_leg_tip_xy - table_hole_pos_robot[:2]) < 0.009
+            leg_xy_near_hole = torch.norm(_leg_tip_xy - table_hole_pos_robot[:2]) < 0.011
             leg_xy_near_hole_loose = torch.norm(_leg_tip_xy - table_hole_pos_robot[:2]) < 0.015
         # Strict XY alignment required to hand off from reach_table_top_z to insert.
         leg_xy_aligned_strict = torch.norm(_leg_tip_xy - table_hole_pos_robot[:2]) < 0.003
@@ -1397,7 +1397,7 @@ class Leg(Part):
             clean_target = C.to_homogeneous(target_pos, target_ori)
             clean_target = self._apply_latent_offset(state, clean_target)
             target = self._add_noise_to_target(clean_target, pos_std=0.0, ori_std_deg=0.0)  # NO NOISE during screw
-            result = self.satisfy(ee_pose, target, ori_error_threshold=0.3, max_len=75)
+            result = self.satisfy(ee_pose, target, ori_error_threshold=0.3, max_len=85)
             if result == "TIMEOUT":
                 timeout_failure = True
 
