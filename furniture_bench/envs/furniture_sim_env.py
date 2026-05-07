@@ -1424,6 +1424,9 @@ class FurnitureSimEnv(gym.Env):
                 [part_pose.r.x, part_pose.r.y, part_pose.r.z, part_pose.r.w],
                 device=self.device,
             )
+            # Zero linear and angular velocity so residual velocity from the
+            # previous episode does not carry over into the new one.
+            self.root_tensor.view(self.num_envs, -1, 13)[env_idx, idxs, 7:] = 0.0
 
         if skip_set_state:
             # Set the value for the root state tensor, but don't call isaac gym function yet (useful when resetting all at once)
