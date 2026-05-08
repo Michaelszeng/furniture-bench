@@ -21,7 +21,7 @@ class Leg(Part):
     # ── Per-state noise tiers ──────────────────────────────────────────────────
     # Target-noise tiers (used by apply_non_markovian_config for latent offsets)
     _LOW_LATENT_TARGET_STD_STATES: frozenset = frozenset(
-        {"reach_leg_floor_z", "pick_leg", "reach_table_top_z", "release", "pre_screw"}
+        {"reach_leg_floor_z", "pick_leg", "reach_table_top_xy", "reach_table_top_z", "release", "pre_screw"}
     )
     _LOW_LATENT_TARGET_Z_STD_STATES: frozenset = frozenset(
         {
@@ -82,7 +82,7 @@ class Leg(Part):
     # Before reaching the final pick pose, the EE makes 1..MAX_CYCLES approaches
     # from progressively smaller positive-x / positive-z offsets, with a random y
     # jitter each cycle.  The final cycle uses the clean target with no offset.
-    _NM_REACH_LEG_FLOOR_Z_MIN_ALIGN_CYCLES: int = 2  # must be >=2 or will cause divide by zero error
+    _NM_REACH_LEG_FLOOR_Z_MIN_ALIGN_CYCLES: int = 3  # must be >=2 or will cause divide by zero error
     _NM_REACH_LEG_FLOOR_Z_MAX_ALIGN_CYCLES: int = 3  # max staged cycles (final clean cycle always added)
     _NM_REACH_LEG_FLOOR_Z_ALIGN_STEPS_MIN: int = 8  # min steps per cycle
     _NM_REACH_LEG_FLOOR_Z_ALIGN_STEPS_MAX: int = 10  # max steps per cycle
@@ -98,8 +98,8 @@ class Leg(Part):
     # alignment.  After all cycles, the EE targets the clean hole position.
     _NM_REACH_TABLE_TOP_Z_MIN_ALIGN_CYCLES: int = 1
     _NM_REACH_TABLE_TOP_Z_MAX_ALIGN_CYCLES: int = 2
-    _NM_REACH_TABLE_TOP_Z_ALIGN_STEPS_MIN: int = 6  # min steps per cycle
-    _NM_REACH_TABLE_TOP_Z_ALIGN_STEPS_MAX: int = 8  # max steps per cycle
+    _NM_REACH_TABLE_TOP_Z_ALIGN_STEPS_MIN: int = 4  # min steps per cycle
+    _NM_REACH_TABLE_TOP_Z_ALIGN_STEPS_MAX: int = 9  # max steps per cycle
     _NM_REACH_TABLE_TOP_Z_ALIGN_XY_STD: float = 0.006  # std of random XY offset per cycle (m)
     _NM_REACH_TABLE_TOP_Z_ALIGN_XY_MAX: float = 0.009  # max absolute XY offset per cycle (m)
 
@@ -112,16 +112,16 @@ class Leg(Part):
 
     # ── Sticky transition delays ───────────────────────────────────────────
     _NM_STICKY_REACH_LEG_FLOOR_Z_PICK_LEG_MIN_DELAY: int = 8
-    _NM_STICKY_REACH_LEG_FLOOR_Z_PICK_LEG_MAX_DELAY: int = 12
+    _NM_STICKY_REACH_LEG_FLOOR_Z_PICK_LEG_MAX_DELAY: int = 13
 
-    _NM_STICKY_PICK_LEG_LIFT_UP_MIN_DELAY: int = 5
+    _NM_STICKY_PICK_LEG_LIFT_UP_MIN_DELAY: int = 6
     _NM_STICKY_PICK_LEG_LIFT_UP_MAX_DELAY: int = 8
 
     _NM_STICKY_PRE_SCREW_SCREW_GRASP_MIN_DELAY: int = 5
     _NM_STICKY_PRE_SCREW_SCREW_GRASP_MAX_DELAY: int = 8
 
-    _NM_STICKY_REACH_TABLE_TOP_Z_INSERT_MIN_DELAY: int = 5  # linger at alignment before committing to insert
-    _NM_STICKY_REACH_TABLE_TOP_Z_INSERT_MAX_DELAY: int = 9
+    _NM_STICKY_REACH_TABLE_TOP_Z_INSERT_MIN_DELAY: int = 3  # linger at alignment before committing to insert
+    _NM_STICKY_REACH_TABLE_TOP_Z_INSERT_MAX_DELAY: int = 7
 
     _NM_STICKY_SCREW_RELEASE_MIN_DELAY: int = 4
     _NM_STICKY_SCREW_RELEASE_MAX_DELAY: int = 8
@@ -136,11 +136,11 @@ class Leg(Part):
     _PICK_Z_OFFSET: float = 0.012  # EE hovers 1.2 cm above the leg COM during floor pick
     _INSERT_HANDOFF_Z: float = 0.025  # z distance from the table to the leg tip when ready to insert
 
+    _PICK_X_OFFSET: float = 0.005  # grab 0.5 cm toward "top" of leg along X
+    _ORI_Z_CLEARANCE: float = 0.05  # Z clearance during orientation alignment
+
     def __init__(self, part_config, part_idx):
         super().__init__(part_config, part_idx)
-
-        self._PICK_X_OFFSET: float = 0.002 if self.non_markovian else 0.005  # grab 0.5 cm toward "top" of leg along X
-        self._ORI_Z_CLEARANCE: float = 0.13 if self.non_markovian else 0.05  # Z clearance during orientation alignment
 
         tag_ids = part_config["ids"]
 
@@ -197,6 +197,11 @@ class Leg(Part):
         self.leg_tip_z_rel: float = float("inf")  # set each step by compute_state
         self.gripper_action = -1
 
+    def _on_non_markovian_set(self):
+        """Override NM-specific instance variables when non_markovian is set to True."""
+        self._PICK_X_OFFSET = 0.003
+        self._ORI_Z_CLEARANCE = 0.06
+
     def apply_non_markovian_config(self):
         """Sample episode-level non-Markovian latent variables."""
         if not self._NM_LATENT_PLAN:
@@ -252,6 +257,10 @@ class Leg(Part):
             }
             for state in all_states
         }
+        offsets_str = "\n".join(
+            f"  {state}: pos={v['pos']}, ori={v['ori']}" for state, v in self.latent_offsets.items()
+        )
+        print(f"[LEG] latent_offsets:\n{offsets_str}")
 
     def is_in_reset_ori(self, pose: npt.NDArray[np.float32], from_skill, ori_bound) -> bool:
         # y-axis of the leg align with y-axis of the base.
@@ -431,8 +440,7 @@ class Leg(Part):
         # Use leg tip (screw threads) rather than COM for the XY proximity check.
         # Tip is LEG_TIP_OFFSET m in the -local-Y direction from the mesh origin.
         if self.non_markovian:
-            leg_xy_near_hole = torch.norm(_leg_tip_xy - table_hole_pos_robot[:2]) < 0.015  # looser for NM
-            leg_xy_near_hole_loose = torch.norm(_leg_tip_xy - table_hole_pos_robot[:2]) < 0.020
+            leg_xy_near_hole = torch.norm(_leg_tip_xy - table_hole_pos_robot[:2]) < 0.018  # looser for NM
         else:
             leg_xy_near_hole = torch.norm(_leg_tip_xy - table_hole_pos_robot[:2]) < 0.011
             leg_xy_near_hole_loose = torch.norm(_leg_tip_xy - table_hole_pos_robot[:2]) < 0.015
@@ -448,10 +456,11 @@ class Leg(Part):
             5 if self.non_markovian else 4
         )
 
-        # Sometimes, due to action noise, leg_xy_near_hole may become untrue momentarily.
-        # If the leg is still close to the hole and the robot is moving downward, we know we're probably still in
-        # "reach_table_top_z".
-        barely_missed_hole = leg_xy_near_hole_loose and leg_z_vel_robot < -0.06 and ee_at_insert_ori
+        if not self.non_markovian:
+            # Sometimes, due to action noise, leg_xy_near_hole may become untrue momentarily.
+            # If the leg is still close to the hole and the robot is moving downward, we know we're probably still in
+            # "reach_table_top_z".
+            barely_missed_hole = leg_xy_near_hole_loose and leg_z_vel_robot < -0.06 and ee_at_insert_ori
 
         # Insertion depth: leg tip Z relative to table surface (in robot frame).
         leg_z_rel = leg_pose_robot[2, 3] - table_pose_robot[2, 3]
@@ -463,7 +472,7 @@ class Leg(Part):
         at_pre_screw_target_pos = (ee_pos - (pre_screw_target_pos + lo_t)).abs().sum() < self.pos_error_threshold * 3
         at_pre_screw_target_ori = (ee_pose[:3, :3] - pre_screw_target_ori).abs().sum() < self.ori_error_threshold * 1.5
 
-        screw_done = (ee_pose[:3, :3] - screw_target_ori).abs().sum() < self.ori_error_threshold * 1.5
+        screw_done = (ee_pose[:3, :3] - screw_target_ori).abs().sum() < self.ori_error_threshold * 2.5
 
         # Insertion stuck detection — runs whenever the EE is in the insertion sub-phase (grasped, near hole,
         # at insert_ori).  Updates prev_ state variables and sets self.GOT_STUCK; does not return.
@@ -1082,7 +1091,7 @@ class Leg(Part):
             if result == "TIMEOUT":
                 timeout_failure = True
         elif state == "reach_table_top_z":
-            self.set_speed(max_delta_xy=0.004, max_delta_z=0.015)
+            self.set_speed(max_delta_xy=0.005, max_delta_z=0.015)
             target_leg_tip_pose_robot = torch.tensor(
                 [  # Target for leg TIP: LEG_HOLE_OFFSET_X/Y align tip with table hole
                     [1.0, 0.0, 0.0, table_hole_pose_robot[0, 3] + self._LEG_HOLE_OFFSET_X],
@@ -1260,7 +1269,7 @@ class Leg(Part):
                 timeout_failure = True
         elif state == "pre_screw":
             target_pos = (april_to_robot @ leg_pose)[:3, 3].clone()
-            target_pos[2] = 0.055 if not self.non_markovian else 0.061  # A little higher if there is target step noise
+            target_pos[2] = 0.055 if not self.non_markovian else 0.065  # A little higher if there is target step noise
 
             ee_z_dot_down = -ee_pose[2, 2]  # 1.0 = EE Z-axis straight down
             ee_x_dot_world_x = ee_pose[0, 0]  # X-component of EE local-X (world frame)

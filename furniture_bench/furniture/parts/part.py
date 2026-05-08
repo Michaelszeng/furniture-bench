@@ -72,7 +72,22 @@ class Part(ABC):
         self.no_noise = False  # set by --no-noise: disables ALL noise including step noise
         self.no_iid_target_noise = False  # set by _ENABLE_TARGET_NOISE=False: disables only i.i.d. per-step jitter
         self.dart_amount = 1.0
-        self.non_markovian = False
+        self._non_markovian = False
+
+    @property
+    def non_markovian(self) -> bool:
+        return self._non_markovian
+
+    @non_markovian.setter
+    def non_markovian(self, value: bool):
+        was_nm = self._non_markovian
+        self._non_markovian = value
+        if value and not was_nm:
+            self._on_non_markovian_set()
+
+    def _on_non_markovian_set(self):
+        """Called once when non_markovian transitions False → True. Override in subclasses."""
+        pass
 
     def randomize_init_pose(self, from_skill=0, pos_range=[-0.05, 0.05], rot_range=45):
         self.reset_pos[from_skill][:2] = self.part_config["reset_pos"][from_skill][:2] + np.random.uniform(

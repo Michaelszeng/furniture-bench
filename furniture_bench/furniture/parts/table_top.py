@@ -16,7 +16,6 @@ from furniture_bench.utils.pose import get_mat, is_similar_rot, rot_mat
 class TableTop(Part):
     # ── Per-state noise tiers ──────────────────────────────────────────────────
     # Target-noise tiers (used by apply_non_markovian_config for latent offsets / step noise stds).
-    # Target-noise tiers (used by apply_non_markovian_config for latent offsets / step noise stds).
     # NOTE: these do not affect the random per-step target noise in _add_noise_to_target(), only affect the latent
     # plan offsets and step noise stds.
     _LOW_LATENT_TARGET_STD_STATES: frozenset = frozenset(
@@ -59,7 +58,7 @@ class TableTop(Part):
         self.gripper_action = -1
         self.body_grip_width = 0.01
         # Fractional offset along the grasped side: 0.0 = center, 0.5 = 3/4 from one end.
-        self.grasp_side_offset_frac = -0.18 if self.non_markovian else -0.25  # Closer to center for NM
+        self.grasp_side_offset_frac = -0.18 if self.non_markovian else -0.23  # Closer to center for NM
 
         self.skill_complete_next_states = [
             "push",
@@ -117,7 +116,7 @@ class TableTop(Part):
         offsets_str = "\n".join(
             f"  {state}: pos={v['pos']}, ori={v['ori']}" for state, v in self.latent_offsets.items()
         )
-        print(f"latent_offsets:\n{offsets_str}")
+        print(f"[TABLE_TOP] latent_offsets:\n{offsets_str}")
 
     def is_in_reset_ori(self, pose, from_skill, ori_bound):
         reset_ori = self.reset_ori[from_skill] if len(self.reset_ori) > 1 else self.reset_ori[0]
@@ -478,7 +477,7 @@ class TableTop(Part):
                 )
             else:
                 target = self._add_noise_to_target(clean_target, pos_std=0.001)
-            result = self.satisfy(ee_pose, target, pos_error_threshold=0.02, ori_error_threshold=0.5, max_len=300)
+            result = self.satisfy(ee_pose, target, pos_error_threshold=0.02, ori_error_threshold=0.5, max_len=200)
             if result == "TIMEOUT":
                 timeout_failure = True
 
