@@ -1052,7 +1052,7 @@ class Leg(Part):
             if result == "TIMEOUT":
                 timeout_failure = True
         elif state == "reach_table_top_xy":
-            target_z = 0.11 if self.non_markovian else 0.14
+            target_z = 0.125 if self.non_markovian else 0.14
             target_leg_tip_pose_robot = torch.tensor(
                 [  # Target for leg TIP: LEG_HOLE_OFFSET_X/Y align tip with table hole
                     [1.0, 0.0, 0.0, table_hole_pose_robot[0, 3] + self._LEG_HOLE_OFFSET_X],
