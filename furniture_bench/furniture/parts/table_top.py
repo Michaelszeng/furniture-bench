@@ -30,7 +30,7 @@ class TableTop(Part):
     # ── Sticky transition delays ───────────────────────────────────────────
     # Min/Max extra steps the robot lingers in "push" after at_push_xy is first satisfied,
     # before transitioning to "release".
-    _NM_STICKY_PUSH_RELEASE_MAX_DELAY: int = 15
+    _NM_STICKY_PUSH_RELEASE_MAX_DELAY: int = 16
     _NM_STICKY_PUSH_RELEASE_MIN_DELAY: int = 9
 
     # Min/Max extra steps the robot lingers in "reach_body_grasp_z" after at_body_z is first satisfied,

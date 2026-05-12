@@ -34,10 +34,10 @@ class Leg(Part):
         }
     )
     _ZERO_LATENT_TARGET_POS_STD_STATES: frozenset = frozenset(
-        {"reach_leg_ori", "reach_leg_floor_z", "screw_grasp", "screw", "insert_release", "insert"}
+        {"reach_leg_ori", "reach_leg_floor_z", "pick_leg", "screw_grasp", "screw", "insert_release", "insert"}
     )
     _ZERO_LATENT_TARGET_ORI_STD_STATES: frozenset = frozenset(
-        {"reach_leg_ori", "screw_grasp", "screw", "insert_release", "insert"}
+        {"reach_leg_ori", "pick_leg", "screw_grasp", "screw", "insert_release", "insert"}
     )
 
     # Action-noise tiers (used by furniture_sim_env when computing the executed action).
@@ -67,8 +67,8 @@ class Leg(Part):
     # (mimicking a human repositioning to align) followed by one final clean cycle.
     _NM_SCREW_GRASP_MIN_ALIGN_CYCLES: int = 1
     _NM_SCREW_GRASP_MAX_ALIGN_CYCLES: int = 2  # max random cycles
-    _NM_SCREW_GRASP_ALIGN_STEPS_MIN: int = 3  # min steps per cycle
-    _NM_SCREW_GRASP_ALIGN_STEPS_MAX: int = 8  # max steps per cycle
+    _NM_SCREW_GRASP_ALIGN_STEPS_MIN: int = 5  # min steps per cycle
+    _NM_SCREW_GRASP_ALIGN_STEPS_MAX: int = 10  # max steps per cycle
     _NM_SCREW_GRASP_ALIGN_CLEAN_CYCLE_EXTRA_STEPS: int = (
         12  # extra steps added to the final clean cycle for VT convergence
     )
@@ -82,10 +82,10 @@ class Leg(Part):
     # Before reaching the final pick pose, the EE makes 1..MAX_CYCLES approaches
     # from progressively smaller positive-x / positive-z offsets, with a random y
     # jitter each cycle.  The final cycle uses the clean target with no offset.
-    _NM_REACH_LEG_FLOOR_Z_MIN_ALIGN_CYCLES: int = 3  # must be >=2 or will cause divide by zero error
+    _NM_REACH_LEG_FLOOR_Z_MIN_ALIGN_CYCLES: int = 2  # must be >=2 or will cause divide by zero error
     _NM_REACH_LEG_FLOOR_Z_MAX_ALIGN_CYCLES: int = 3  # max staged cycles (final clean cycle always added)
-    _NM_REACH_LEG_FLOOR_Z_ALIGN_STEPS_MIN: int = 8  # min steps per cycle
-    _NM_REACH_LEG_FLOOR_Z_ALIGN_STEPS_MAX: int = 10  # max steps per cycle
+    _NM_REACH_LEG_FLOOR_Z_ALIGN_STEPS_MIN: int = 9  # min steps per cycle
+    _NM_REACH_LEG_FLOOR_Z_ALIGN_STEPS_MAX: int = 16  # max steps per cycle
     _NM_REACH_LEG_FLOOR_Z_ALIGN_X_OFFSET_MAX: float = 0.02  # x offset (m) at cycle 0, ramps to 0
     _NM_REACH_LEG_FLOOR_Z_ALIGN_Z_OFFSET_MAX: float = 0.02  # z offset (m) at cycle 0, ramps to 0
     _NM_REACH_LEG_FLOOR_Z_ALIGN_X_STD: float = 0.015  # std of random x jitter per cycle (m)
@@ -96,10 +96,10 @@ class Leg(Part):
     # Before descending to insert, the EE makes 1..MAX_CYCLES passes with random XY
     # offsets from the hole centre, mimicking a human hovering/jittering to check
     # alignment.  After all cycles, the EE targets the clean hole position.
-    _NM_REACH_TABLE_TOP_Z_MIN_ALIGN_CYCLES: int = 1
-    _NM_REACH_TABLE_TOP_Z_MAX_ALIGN_CYCLES: int = 2
-    _NM_REACH_TABLE_TOP_Z_ALIGN_STEPS_MIN: int = 4  # min steps per cycle
-    _NM_REACH_TABLE_TOP_Z_ALIGN_STEPS_MAX: int = 9  # max steps per cycle
+    _NM_REACH_TABLE_TOP_Z_MIN_ALIGN_CYCLES: int = 2
+    _NM_REACH_TABLE_TOP_Z_MAX_ALIGN_CYCLES: int = 3
+    _NM_REACH_TABLE_TOP_Z_ALIGN_STEPS_MIN: int = 9  # min steps per cycle
+    _NM_REACH_TABLE_TOP_Z_ALIGN_STEPS_MAX: int = 16  # max steps per cycle
     _NM_REACH_TABLE_TOP_Z_ALIGN_XY_STD: float = 0.006  # std of random XY offset per cycle (m)
     _NM_REACH_TABLE_TOP_Z_ALIGN_XY_MAX: float = 0.009  # max absolute XY offset per cycle (m)
 
@@ -885,7 +885,7 @@ class Leg(Part):
                 timeout_failure = True
         elif state == "reach_leg_floor_z":
             if self.non_markovian:
-                self.set_speed(delta_pos_gain=1.2, max_delta_xy=0.005)
+                self.set_speed(delta_pos_gain=1.0, max_delta_xy=0.0025)
 
             if self.non_markovian:
                 if self.nm_floor_pick_cached_leg_pose_down is None:
@@ -957,12 +957,13 @@ class Leg(Part):
                             0, self.nm_reach_leg_floor_z_total_cycles
                         )  # final clean cycle: frac=0 → no offset
                     else:
+                        # Final clean cycle just ended — mark done; pick_leg will reuse the same offset.
                         self.nm_reach_leg_floor_z_align_done = True
 
-                pos = (
-                    target_pos
-                    if self.nm_reach_leg_floor_z_align_done
-                    else target_pos + self.nm_reach_leg_floor_z_align_offset
+                pos = target_pos + (
+                    self.nm_reach_leg_floor_z_align_offset
+                    if self.nm_reach_leg_floor_z_align_offset is not None
+                    else torch.zeros(3, dtype=target_pos.dtype, device=device)
                 )
                 clean_target = C.to_homogeneous(pos, target_ori)
                 clean_target = self._apply_latent_offset(state, clean_target)
@@ -996,6 +997,7 @@ class Leg(Part):
                 timeout_failure = True
         elif state == "pick_leg":
             if self.non_markovian:
+                self.set_speed(delta_pos_gain=0.05, max_delta_xy=0.0005)
                 if self.nm_floor_pick_cached_leg_pose_down is None:
                     self.nm_floor_pick_cached_leg_pose_down = self._find_down_z(leg_pose).clone().to(device)
                 leg_pose_down = self.nm_floor_pick_cached_leg_pose_down
@@ -1006,6 +1008,9 @@ class Leg(Part):
             target_pos = leg_pos_robot.clone()
             target_pos[0] = leg_pos_robot[0] + self._PICK_X_OFFSET
             target_pos[2] = leg_pos_robot[2] + self._PICK_Z_OFFSET
+            if self.non_markovian and self.nm_reach_leg_floor_z_align_offset is not None:
+                # Continue at the same offset position as the last reach_leg_floor_z cycle.
+                target_pos = target_pos + self.nm_reach_leg_floor_z_align_offset
 
             clean_target = C.to_homogeneous(target_pos, target_ori)
             clean_target = self._apply_latent_offset(state, clean_target)
@@ -1091,7 +1096,10 @@ class Leg(Part):
             if result == "TIMEOUT":
                 timeout_failure = True
         elif state == "reach_table_top_z":
-            self.set_speed(max_delta_xy=0.005, max_delta_z=0.015)
+            if self.non_markovian:
+                self.set_speed(delta_pos_gain=1.0, max_delta_xy=0.003, max_delta_z=0.015)
+            else:
+                self.set_speed(max_delta_xy=0.005, max_delta_z=0.015)
             target_leg_tip_pose_robot = torch.tensor(
                 [  # Target for leg TIP: LEG_HOLE_OFFSET_X/Y align tip with table hole
                     [1.0, 0.0, 0.0, table_hole_pose_robot[0, 3] + self._LEG_HOLE_OFFSET_X],
@@ -1277,7 +1285,8 @@ class Leg(Part):
             # 2-stage sequence: first right the gripper (so it is vertical); then, rotate +180 deg about
             # world-Z to pre_screw_ori.
             print(f"ee_z_dot_down: {ee_z_dot_down}")
-            if ee_z_dot_down < 0.9975:
+            ee_z_dot_down_threshold = 0.9975 if not self.non_markovian else 0.995
+            if ee_z_dot_down < ee_z_dot_down_threshold:
                 # Phase 1: right the gripper vertically
                 target_ori = C.rot_mat_tensor(np.pi, 0, 0, device)[:3, :3]
             else:
@@ -1303,6 +1312,8 @@ class Leg(Part):
             if result == "TIMEOUT":
                 timeout_failure = True
         elif state == "screw_grasp":
+            if self.non_markovian:
+                self.set_speed(delta_pos_gain=1.0, max_delta_xy=0.003)
             # IMPORTANT: define target relative to leg pose so that we grab it centered
             target_pos = (april_to_robot @ leg_pose)[:3, 3].clone()
             target_pos[2] = 0.055

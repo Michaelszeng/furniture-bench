@@ -62,21 +62,21 @@ _ENABLE_ACTION_NOISE: bool = True
 # This noise gets rolled out in simulation and also recorded into the "clean actions" into the dataset.
 _ENABLE_CORR_ACTION_NOISE: bool = False
 # OU smoothing factor: τ = 1/(1-alpha) steps.  0.97 → τ≈33 steps (~3 s at 10 Hz).
-_CORR_NOISE_ALPHA: float = 0.75
+_CORR_NOISE_ALPHA: float = 0.9
 
 # ── Non-Markovian virtual-target walk ─────────────────────────────────────────
 # When enabled, the EE is commanded toward a virtual target (VT) that wanders
 # stochastically toward the FSM goal rather than directly chasing it, producing
 # varied human-like approach trajectories.  Parameters match the tuned values in
 # scripts/plot_nm_virtual_target.py.
-_ENABLE_NM_VIRTUAL_TARGET: bool = True
-_NM_VT_ALPHA_POS: float = 0.85  # position velocity momentum (0 = memoryless)
-_NM_VT_K_POS: float = 0.05  # position spring constant toward goal
+_ENABLE_NM_VIRTUAL_TARGET: bool = False
+_NM_VT_ALPHA_POS: float = 0.6  # position velocity momentum (0 = memoryless)
+_NM_VT_K_POS: float = 0.15  # position spring constant toward goal
 _NM_VT_SIGMA_POS: float = 0.005  # position noise std (m) at full distance
 _NM_VT_FALLOFF_FRAC_POS: float = 0.80  # noise ramps off within this fraction of initial dist
 
 _NM_VT_ALPHA_ORI: float = 0.95  # orientation angular-velocity momentum
-_NM_VT_K_ORI: float = 0.15  # orientation spring constant toward goal
+_NM_VT_K_ORI: float = 0.25  # orientation spring constant toward goal
 _NM_VT_SIGMA_ORI: float = np.radians(1.0)  # orientation noise std (rad) at full angle error
 _NM_VT_FALLOFF_FRAC_ORI: float = 0.60  # noise ramps off within this fraction of initial angle
 
