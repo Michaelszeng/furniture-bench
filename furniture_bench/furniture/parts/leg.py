@@ -67,8 +67,8 @@ class Leg(Part):
     # (mimicking a human repositioning to align) followed by one final clean cycle.
     _NM_SCREW_GRASP_MIN_ALIGN_CYCLES: int = 1
     _NM_SCREW_GRASP_MAX_ALIGN_CYCLES: int = 2  # max random cycles
-    _NM_SCREW_GRASP_ALIGN_STEPS_MIN: int = 5  # min steps per cycle
-    _NM_SCREW_GRASP_ALIGN_STEPS_MAX: int = 10  # max steps per cycle
+    _NM_SCREW_GRASP_ALIGN_STEPS_MIN: int = 3  # min steps per cycle
+    _NM_SCREW_GRASP_ALIGN_STEPS_MAX: int = 8  # max steps per cycle
     _NM_SCREW_GRASP_ALIGN_CLEAN_CYCLE_EXTRA_STEPS: int = (
         12  # extra steps added to the final clean cycle for VT convergence
     )
@@ -84,8 +84,8 @@ class Leg(Part):
     # jitter each cycle.  The final cycle uses the clean target with no offset.
     _NM_REACH_LEG_FLOOR_Z_MIN_ALIGN_CYCLES: int = 2  # must be >=2 or will cause divide by zero error
     _NM_REACH_LEG_FLOOR_Z_MAX_ALIGN_CYCLES: int = 3  # max staged cycles (final clean cycle always added)
-    _NM_REACH_LEG_FLOOR_Z_ALIGN_STEPS_MIN: int = 9  # min steps per cycle
-    _NM_REACH_LEG_FLOOR_Z_ALIGN_STEPS_MAX: int = 16  # max steps per cycle
+    _NM_REACH_LEG_FLOOR_Z_ALIGN_STEPS_MIN: int = 8  # min steps per cycle
+    _NM_REACH_LEG_FLOOR_Z_ALIGN_STEPS_MAX: int = 10  # max steps per cycle
     _NM_REACH_LEG_FLOOR_Z_ALIGN_X_OFFSET_MAX: float = 0.02  # x offset (m) at cycle 0, ramps to 0
     _NM_REACH_LEG_FLOOR_Z_ALIGN_Z_OFFSET_MAX: float = 0.02  # z offset (m) at cycle 0, ramps to 0
     _NM_REACH_LEG_FLOOR_Z_ALIGN_X_STD: float = 0.015  # std of random x jitter per cycle (m)
@@ -96,10 +96,10 @@ class Leg(Part):
     # Before descending to insert, the EE makes 1..MAX_CYCLES passes with random XY
     # offsets from the hole centre, mimicking a human hovering/jittering to check
     # alignment.  After all cycles, the EE targets the clean hole position.
-    _NM_REACH_TABLE_TOP_Z_MIN_ALIGN_CYCLES: int = 2
+    _NM_REACH_TABLE_TOP_Z_MIN_ALIGN_CYCLES: int = 1
     _NM_REACH_TABLE_TOP_Z_MAX_ALIGN_CYCLES: int = 3
-    _NM_REACH_TABLE_TOP_Z_ALIGN_STEPS_MIN: int = 9  # min steps per cycle
-    _NM_REACH_TABLE_TOP_Z_ALIGN_STEPS_MAX: int = 16  # max steps per cycle
+    _NM_REACH_TABLE_TOP_Z_ALIGN_STEPS_MIN: int = 6  # min steps per cycle
+    _NM_REACH_TABLE_TOP_Z_ALIGN_STEPS_MAX: int = 8  # max steps per cycle
     _NM_REACH_TABLE_TOP_Z_ALIGN_XY_STD: float = 0.006  # std of random XY offset per cycle (m)
     _NM_REACH_TABLE_TOP_Z_ALIGN_XY_MAX: float = 0.009  # max absolute XY offset per cycle (m)
 
@@ -111,20 +111,20 @@ class Leg(Part):
     _NM_INSERTION_PAUSE_STEPS_MAX: int = 8
 
     # ── Sticky transition delays ───────────────────────────────────────────
-    _NM_STICKY_REACH_LEG_FLOOR_Z_PICK_LEG_MIN_DELAY: int = 8
-    _NM_STICKY_REACH_LEG_FLOOR_Z_PICK_LEG_MAX_DELAY: int = 13
+    _NM_STICKY_REACH_LEG_FLOOR_Z_PICK_LEG_MIN_DELAY: int = 6
+    _NM_STICKY_REACH_LEG_FLOOR_Z_PICK_LEG_MAX_DELAY: int = 12
 
-    _NM_STICKY_PICK_LEG_LIFT_UP_MIN_DELAY: int = 6
+    _NM_STICKY_PICK_LEG_LIFT_UP_MIN_DELAY: int = 5
     _NM_STICKY_PICK_LEG_LIFT_UP_MAX_DELAY: int = 8
 
     _NM_STICKY_PRE_SCREW_SCREW_GRASP_MIN_DELAY: int = 5
     _NM_STICKY_PRE_SCREW_SCREW_GRASP_MAX_DELAY: int = 8
 
-    _NM_STICKY_REACH_TABLE_TOP_Z_INSERT_MIN_DELAY: int = 3  # linger at alignment before committing to insert
+    _NM_STICKY_REACH_TABLE_TOP_Z_INSERT_MIN_DELAY: int = 5  # linger at alignment before committing to insert
     _NM_STICKY_REACH_TABLE_TOP_Z_INSERT_MAX_DELAY: int = 7
 
     _NM_STICKY_SCREW_RELEASE_MIN_DELAY: int = 4
-    _NM_STICKY_SCREW_RELEASE_MAX_DELAY: int = 8
+    _NM_STICKY_SCREW_RELEASE_MAX_DELAY: int = 7
 
     # Ry angle (radians) that pitches the EE toward the floor during the floor pick-up.
     # Adjust here to change the grasp tilt; used identically in compute_state and fsm_step.
