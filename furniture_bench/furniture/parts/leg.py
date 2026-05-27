@@ -813,6 +813,7 @@ class Leg(Part):
         )
 
         if state == "reach_leg_floor_xy":
+            self.gripper_action = -1  # approaching leg on floor, gripper open
             if self.non_markovian:
                 if self.nm_floor_pick_cached_leg_pose_down is None:
                     self.nm_floor_pick_cached_leg_pose_down = self._find_down_z(leg_pose).clone().to(device)
@@ -852,6 +853,7 @@ class Leg(Part):
             if result == "TIMEOUT":
                 timeout_failure = True
         elif state == "reach_leg_ori":
+            self.gripper_action = -1  # rotating EE to grasp orientation, gripper open
             if self.non_markovian:
                 if self.nm_floor_pick_cached_leg_pose_down is None:
                     self.nm_floor_pick_cached_leg_pose_down = self._find_down_z(leg_pose).clone().to(device)
@@ -884,6 +886,7 @@ class Leg(Part):
             if result == "TIMEOUT":
                 timeout_failure = True
         elif state == "reach_leg_floor_z":
+            self.gripper_action = -1  # descending toward leg, gripper still open
             if self.non_markovian:
                 self.set_speed(delta_pos_gain=1.0, max_delta_xy=0.0025)
 
@@ -1020,11 +1023,12 @@ class Leg(Part):
                 )
             else:
                 target = self._add_noise_to_target(clean_target, pos_std=0.01, ori_std_deg=15.0)
-            self.gripper_action = 1
+            self.gripper_action = 1  # grasping leg, grippers closed
             result = self.gripper_less(gripper_width, 2 * self.half_width + 0.001)
             if result == "TIMEOUT":
                 timeout_failure = True
         elif state == "lift_up":
+            self.gripper_action = 1  # leg grasped, hold closed while lifting
             leg_pose_down = self._find_down_z(leg_pose).clone().to(device)
             leg_pos_robot = (april_to_robot @ leg_pose_down[:4, 3])[:3]  # leg COM in the robot frame
             if self.non_markovian:
@@ -1043,6 +1047,7 @@ class Leg(Part):
             if result == "TIMEOUT":
                 timeout_failure = True
         elif state == "match_leg_ori":
+            self.gripper_action = 1  # leg grasped, hold closed while rotating EE
             target_ori = (margin @ C.rot_mat_tensor(np.pi, 0, 0, device))[:3, :3]
             target_pos = self.staging_pos
             clean_target = C.to_homogeneous(target_pos, target_ori)
@@ -1057,6 +1062,7 @@ class Leg(Part):
             if result == "TIMEOUT":
                 timeout_failure = True
         elif state == "reach_table_top_xy":
+            self.gripper_action = 1  # transporting leg to hole, hold closed
             target_z = 0.125 if self.non_markovian else 0.14
             target_leg_tip_pose_robot = torch.tensor(
                 [  # Target for leg TIP: LEG_HOLE_OFFSET_X/Y align tip with table hole
@@ -1096,6 +1102,7 @@ class Leg(Part):
             if result == "TIMEOUT":
                 timeout_failure = True
         elif state == "reach_table_top_z":
+            self.gripper_action = 1  # descending to insert, hold leg closed
             if self.non_markovian:
                 self.set_speed(delta_pos_gain=1.0, max_delta_xy=0.003, max_delta_z=0.015)
             else:
@@ -1201,6 +1208,7 @@ class Leg(Part):
             if result == "TIMEOUT":
                 timeout_failure = True
         elif state == "insert":
+            self.gripper_action = 1  # pushing leg into hole, hold closed
             self.set_speed(max_delta_z=0.015)
             target_leg_tip_pose_robot = torch.tensor(
                 [  # Target for leg TIP: same geometry as reach_table_top_z
@@ -1226,7 +1234,7 @@ class Leg(Part):
             if result == "TIMEOUT":
                 timeout_failure = True
         elif state == "insert_release":
-            self.gripper_action = -1
+            self.gripper_action = -1  # releasing leg into hole, gripper open
             # Sub-phase gate: hold EE in place until the gripper has cleared the leg,
             # then move upward to the pre-screw position.
             gripper_cleared_leg = gripper_width >= 2 * self.half_width + 0.010
@@ -1247,7 +1255,7 @@ class Leg(Part):
                     clean_target, pos_std=0.001, ori_std_deg=1.0
                 )  # zero step noise (ZERO tier)
             else:
-                # Gripper still closing around the leg — hold EE position, keep opening.
+                # Gripper still opening around the leg — hold EE position, keep opening.
                 clean_target = ee_pose.clone()
                 target = clean_target
             result = self.gripper_greater(
@@ -1268,7 +1276,7 @@ class Leg(Part):
                 )
             else:
                 target = self._add_noise_to_target(clean_target, pos_std=0.001, ori_std_deg=1.0)
-            self.gripper_action = -1
+            self.gripper_action = -1  # releasing leg, gripper open
             result = self.gripper_greater(
                 gripper_width,
                 config["robot"]["max_gripper_width"]["square_table"] - 0.001,
@@ -1276,6 +1284,7 @@ class Leg(Part):
             if result == "TIMEOUT":
                 timeout_failure = True
         elif state == "pre_screw":
+            self.gripper_action = -1  # leg already released into hole, EE re-positioning
             target_pos = (april_to_robot @ leg_pose)[:3, 3].clone()
             target_pos[2] = 0.055 if not self.non_markovian else 0.065  # A little higher if there is target step noise
 
@@ -1379,6 +1388,7 @@ class Leg(Part):
                 if result == "TIMEOUT":
                     timeout_failure = True
         elif state == "screw":
+            self.gripper_action = 1  # rotating leg with grip, MUST hold closed
             self.set_speed(delta_pos_gain=4.0)
             # Rotate EE -180° about global Z from pre_screw back to Rx(π).
             # Split into two 90° steps (same technique as pre_screw) to avoid rotational ambiguity.

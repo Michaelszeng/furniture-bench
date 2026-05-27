@@ -400,6 +400,7 @@ class TableTop(Part):
         clean_target = ee_pose.clone()
 
         if state == "reach_body_grasp_xy":
+            self.gripper_action = -1  # approaching body, gripper open
             clean_target = self._get_grasp_target(body_pose_april, april_to_robot, ee_pos, device)
             clean_target = self._apply_latent_offset(state, clean_target)
             if self.non_markovian:
@@ -411,6 +412,7 @@ class TableTop(Part):
                 timeout_failure = True
 
         elif state == "reach_body_grasp_z":
+            self.gripper_action = -1  # descending to grasp body, gripper still open
             grasp_target = self._get_grasp_target(body_pose_april, april_to_robot, ee_pos, device)
             target_pos = grasp_target[:3, 3].clone()
             target_pos[2] = body_pose_robot[2, 3] + self.grasp_z_offset
@@ -447,12 +449,13 @@ class TableTop(Part):
                 )
             else:
                 target = self._add_noise_to_target(clean_target, pos_std=0.003, ori_std_deg=3.0)
-            self.gripper_action = 1
+            self.gripper_action = 1  # grasping body, grippers closed
             result = self.gripper_less(gripper_width, self.body_grip_width)
             if result == "TIMEOUT":
                 timeout_failure = True
 
         elif state == "push":
+            self.gripper_action = 1  # body grasped, hold closed while pushing into place
             if self.non_markovian:
                 self.set_speed(delta_pos_gain=5.0, max_delta_xy=0.5)
             clean_target = self._get_push_target(
@@ -498,7 +501,7 @@ class TableTop(Part):
                 )
             else:
                 target = self._add_noise_to_target(clean_target, pos_std=0.003, ori_std_deg=3.0)
-            self.gripper_action = -1
+            self.gripper_action = -1  # releasing body, gripper open
             result = self.gripper_greater(
                 gripper_width,
                 config["robot"]["max_gripper_width"]["square_table"] - 0.001,
@@ -507,6 +510,7 @@ class TableTop(Part):
                 timeout_failure = True
 
         elif state == "go_up":
+            self.gripper_action = -1  # body already released, EE retreating
             push_target = self._get_push_target(
                 rb_states,
                 part_idxs,
@@ -551,7 +555,7 @@ class TableTop(Part):
                 )
             else:
                 target = self._add_noise_to_target(clean_target, pos_std=0.003, ori_std_deg=3.0)
-            self.gripper_action = -1
+            self.gripper_action = -1  # gripper open
 
         skill_complete = self.state_transition_handler(self._last_state, state)
         return (

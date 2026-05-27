@@ -194,7 +194,7 @@ class FurnitureSimEnv(gym.Env):
         self.no_noise = no_noise
         self.corr_noise_alpha = corr_noise_alpha
         self.non_markovian = non_markovian
-        self._corr_noise_state = {}  # (env_idx, part_idx) -> {'pos': Tensor(3), 'aa': ndarray(3)}
+        self._nm_corr_noise_state = {}  # (env_idx, part_idx) -> {'pos': Tensor(3), 'aa': ndarray(3)}
         # Per-env Non-Markovian pause state (used by get_assembly_action)
         self._nm_pause_remaining = [0] * num_envs  # steps left in current pause
         self._nm_pause_gripper = [-1.0] * num_envs  # gripper command to hold during pause
@@ -1252,7 +1252,7 @@ class FurnitureSimEnv(gym.Env):
 
         self.furniture.reset()
         self.scripted_timeout = [False] * self.num_envs
-        self._corr_noise_state = {}
+        self._nm_corr_noise_state = {}
         self._nm_pause_remaining = [0] * self.num_envs
         self._nm_pause_gripper = [-1.0] * self.num_envs
         self._nm_vt_pos = [None] * self.num_envs
@@ -1880,12 +1880,12 @@ class FurnitureSimEnv(gym.Env):
                 alpha = _CORR_NOISE_ALPHA
                 scale = np.sqrt(1.0 - alpha**2)
                 key = (env_idx, part_idx2)
-                if key not in self._corr_noise_state:
-                    self._corr_noise_state[key] = {
+                if key not in self._nm_corr_noise_state:
+                    self._nm_corr_noise_state[key] = {
                         "pos": torch.zeros(3, device=self.device),
                         "aa": np.zeros(3),
                     }
-                cs = self._corr_noise_state[key]
+                cs = self._nm_corr_noise_state[key]
                 pos_std = 0.003 * _action_noise_scale
                 cs["pos"] = alpha * cs["pos"] + scale * torch.normal(torch.zeros(3, device=self.device), pos_std)
                 aa_std = np.radians(3 * _action_noise_scale)
