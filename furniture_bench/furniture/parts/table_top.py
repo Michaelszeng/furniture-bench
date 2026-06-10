@@ -14,6 +14,20 @@ from furniture_bench.utils.pose import get_mat, is_similar_rot, rot_mat
 
 
 class TableTop(Part):
+    # All FSM states a TableTop's pre_assemble may set / compute_pre_assemble_state may return.
+    # Authoritative list; reused by apply_non_markovian_config (for latent-offset sampling) and
+    # by dagger_label_gates.py (for state-name validation when the user overrides _last_state
+    # on a labeled gate).
+    ALL_STATES: tuple = (
+        "reach_body_grasp_xy",
+        "reach_body_grasp_z",
+        "pick_body",
+        "push",
+        "release",
+        "go_up",
+        "done",
+    )
+
     # ── Per-state noise tiers ──────────────────────────────────────────────────
     # Target-noise tiers (used by apply_non_markovian_config for latent offsets / step noise stds).
     # NOTE: these do not affect the random per-step target noise in _add_noise_to_target(), only affect the latent
@@ -82,15 +96,7 @@ class TableTop(Part):
         HIGH_ORI_STD = np.radians(3.0)
         LOW_ORI_STD = np.radians(2.0)
 
-        all_states = [
-            "reach_body_grasp_xy",
-            "reach_body_grasp_z",
-            "pick_body",
-            "push",
-            "release",
-            "go_up",
-            "done",
-        ]
+        all_states = list(self.ALL_STATES)  # authoritative state list lives on the class
 
         def pos_std_for(state):
             if state in self._ZERO_LATENT_TARGET_STD_STATES:

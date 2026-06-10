@@ -13,6 +13,27 @@ from furniture_bench.utils.pose import get_mat, is_similar_rot, is_similar_xz, r
 
 
 class Leg(Part):
+    # All FSM states a Leg's fsm_step may set / compute_state may return.
+    # Authoritative list; reused by apply_non_markovian_config (for latent-offset
+    # sampling) and by dagger_label_gates.py (for state-name validation when the
+    # user overrides _last_state on a labeled gate).
+    ALL_STATES: tuple = (
+        "reach_leg_floor_xy",
+        "reach_leg_ori",
+        "reach_leg_floor_z",
+        "pick_leg",
+        "lift_up",
+        "match_leg_ori",
+        "reach_table_top_xy",
+        "reach_table_top_z",
+        "insert",
+        "insert_release",
+        "release",
+        "pre_screw",
+        "screw_grasp",
+        "screw",
+    )
+
     # ── Non-Markovian feature toggles (active only when --non-markovian is set) ──
     _NM_PAUSE_EXCLUDED_STATES: frozenset = frozenset(
         {"release", "lift_up", "reach_leg_floor_xy", "reach_leg_floor_z", "insert"}
@@ -212,22 +233,7 @@ class Leg(Part):
         HIGH_ORI_STD = np.radians(3.0)  # rad — persistent orientation offset for coarse-motion states
         LOW_ORI_STD = np.radians(2.0)  # rad — persistent orientation offset for precision states
 
-        all_states = [
-            "reach_leg_floor_xy",
-            "reach_leg_ori",
-            "reach_leg_floor_z",
-            "pick_leg",
-            "lift_up",
-            "match_leg_ori",
-            "reach_table_top_xy",
-            "reach_table_top_z",
-            "insert",
-            "insert_release",
-            "release",
-            "pre_screw",
-            "screw_grasp",
-            "screw",
-        ]
+        all_states = list(self.ALL_STATES)  # authoritative state list lives on the class
 
         def pos_std_for(state):
             """Return a (3,) array of per-axis position stds [x, y, z].
@@ -911,22 +917,22 @@ class Leg(Part):
                     x_off = self._NM_REACH_LEG_FLOOR_Z_ALIGN_X_OFFSET_MAX * frac + float(
                         np.clip(
                             np.random.normal(0, self._NM_REACH_LEG_FLOOR_Z_ALIGN_X_STD),
-                            -self._NM_REACH_LEG_FLOOR_Z_ALIGN_X_STD,
-                            self._NM_REACH_LEG_FLOOR_Z_ALIGN_X_STD,
+                            -self._NM_REACH_LEG_FLOOR_Z_ALIGN_X_STD * 0.8,
+                            self._NM_REACH_LEG_FLOOR_Z_ALIGN_X_STD * 0.8,
                         )
                     )
                     z_off = self._NM_REACH_LEG_FLOOR_Z_ALIGN_Z_OFFSET_MAX * frac + float(
                         np.clip(
                             np.random.normal(0, self._NM_REACH_LEG_FLOOR_Z_ALIGN_Z_STD),
-                            -self._NM_REACH_LEG_FLOOR_Z_ALIGN_Z_STD,
-                            self._NM_REACH_LEG_FLOOR_Z_ALIGN_Z_STD,
+                            -self._NM_REACH_LEG_FLOOR_Z_ALIGN_Z_STD * 0.8,
+                            self._NM_REACH_LEG_FLOOR_Z_ALIGN_Z_STD * 0.8,
                         )
                     )
                     y_off = float(
                         np.clip(
                             np.random.normal(0, self._NM_REACH_LEG_FLOOR_Z_ALIGN_Y_STD),
-                            -self._NM_REACH_LEG_FLOOR_Z_ALIGN_Y_STD * 0.9,  # Clip to -0.9, 0.9 std
-                            self._NM_REACH_LEG_FLOOR_Z_ALIGN_Y_STD * 0.9,
+                            -self._NM_REACH_LEG_FLOOR_Z_ALIGN_Y_STD * 0.7,  # Clip to -0.7, 0.7 std
+                            self._NM_REACH_LEG_FLOOR_Z_ALIGN_Y_STD * 0.7,
                         )
                     )
                     self.nm_reach_leg_floor_z_align_offset = torch.tensor(
