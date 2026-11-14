@@ -124,13 +124,6 @@ class Leg(Part):
     _NM_REACH_TABLE_TOP_Z_ALIGN_XY_STD: float = 0.006  # std of random XY offset per cycle (m)
     _NM_REACH_TABLE_TOP_Z_ALIGN_XY_MAX: float = 0.009  # max absolute XY offset per cycle (m)
 
-    # ── NM insertion descent pauses ───────────────────────────────────────────
-    # During reach_table_top_z, the robot may randomly pause its descent to mimic
-    # a human double-checking alignment before committing to insertion.
-    _NM_INSERTION_PAUSE_PROB: float = 0.2  # per-step probability of starting a pause
-    _NM_INSERTION_PAUSE_STEPS_MIN: int = 3
-    _NM_INSERTION_PAUSE_STEPS_MAX: int = 8
-
     # ── Sticky transition delays ───────────────────────────────────────────
     _NM_STICKY_REACH_LEG_FLOOR_Z_PICK_LEG_MIN_DELAY: int = 6
     _NM_STICKY_REACH_LEG_FLOOR_Z_PICK_LEG_MAX_DELAY: int = 12
@@ -212,9 +205,6 @@ class Leg(Part):
         self.nm_reach_table_top_z_align_done = False
         self.nm_reach_table_top_z_align_step_end = 0
         self.nm_reach_table_top_z_align_offset = None
-        # Insertion descent pause state (NM only).
-        self.nm_insertion_pause_step_end: int = 0
-        self.nm_insertion_pause_cached_z: float = 0.0
         self.leg_tip_z_rel: float = float("inf")  # set each step by compute_state
         self.gripper_action = -1
 
@@ -759,8 +749,6 @@ class Leg(Part):
             if state == "reach_leg_floor_z":
                 self.nm_reach_leg_floor_z_align_cycles_remaining = None
                 self.nm_reach_leg_floor_z_align_done = False
-            if state in ("reach_table_top_z", "insert"):
-                self.nm_insertion_pause_step_end = 0
             if state == "reach_table_top_z":
                 self.nm_reach_table_top_z_align_cycles_remaining = None
                 self.nm_reach_table_top_z_align_done = False

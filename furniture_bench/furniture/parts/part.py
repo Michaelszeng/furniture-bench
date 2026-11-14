@@ -400,8 +400,6 @@ class Part(ABC):
         _last_state so the caller's compute method keeps executing the current state.
         On the next FSM call after the pause, _nm_pop_pending_transition() fires the transition.
         """
-        if not self._NM_PAUSES:
-            return next_state
         self._nm_pending_next_state = next_state
         self._nm_transition_pause_requested = True
         return self._last_state
